@@ -1,6 +1,7 @@
 import csv
 import html
 import io
+import json
 import logging
 import math
 import os
@@ -45,16 +46,10 @@ def health_check():
 
 def run_flask():
     app.run(host="0.0.0.0", port=config.PORT)
-# --- Database Setup (MongoDB Atlas with SSL Fix) ---
-import certifi
 
+# --- Database Setup (MongoDB Atlas) ---
 try:
-    mongo_client = MongoClient(
-        config.MONGO_URI,
-        tls=True,
-        tlsCAFile=certifi.where(),
-        serverSelectionTimeoutMS=5000
-    )
+    mongo_client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
     db = mongo_client[config.MONGO_DB_NAME]
     
     # Setup Collections
@@ -91,7 +86,6 @@ except Exception as e:
     logger.critical(f"Failed to connect to MongoDB Atlas: {e}")
     sys.exit(1)
 
-
 # --- Dynamic Settings Helper ---
 def get_db_settings() -> dict:
     conf = db_settings.find_one({"key": "global_config"})
@@ -108,6 +102,14 @@ def get_db_settings() -> dict:
 # --- Telegram API Client ---
 session = requests.Session()
 BASE_URL = f"https://api.telegram.org/bot{config.BOT_TOKEN}"
+
+def json_dumps(data: Any) -> str:
+    return json.dumps(data)
+
+def esc(text: Any) -> str:
+    if text is None:
+        return ""
+    return html.escape(str(text))
 
 def api_call(method: str, payload: dict = None, files: dict = None) -> Optional[dict]:
     url = f"{BASE_URL}/{method}"
@@ -153,15 +155,6 @@ def send_document(chat_id: int, file_data: bytes, filename: str, caption: str = 
     files = {"document": (filename, file_data, "text/csv")}
     payload = {"chat_id": chat_id, "caption": caption}
     return api_call("sendDocument", payload, files=files)
-
-import json
-def json_dumps(data: Any) -> str:
-    return json.dumps(data)
-
-def esc(text: Any) -> str:
-    if text is None:
-        return ""
-    return html.escape(str(text))
 
 # --- Date/Time Helpers ---
 def get_local_now() -> datetime:
@@ -740,6 +733,9 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
             ]
         }
         edit_message(chat_id, message_id, admin_text, reply_markup=kb)
+
+    elif data == "admin_confirm_broadcast":
+        handle_admin_broadcast_confirm(user_id, chat_id)
 
     elif data == "admin_stats":
         tot_users = db_users.count_documents({})
