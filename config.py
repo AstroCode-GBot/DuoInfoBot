@@ -3,7 +3,15 @@ import sys
 
 # --- Environment Variables & Defaults ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
+import os
+
+# Multiple admin IDs handling (e.g., "6434652846,5684263622")
+ADMIN_IDS_RAW = os.getenv("ADMIN_ID", "")
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
+
+# Secondary check for primary admin
+PRIMARY_ADMIN_ID = ADMIN_IDS[0] if ADMIN_IDS else None
+
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "duo_info_bot")
 
