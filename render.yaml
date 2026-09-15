@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: duo-info-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: "xh1777726_db_user"
+      - key: DUO_API_URL
+        value: "https://duoinfo.onrender.com/api/duo"
+      - key: REQUEST_COST
+        value: "1"
+      - key: DAILY_FREE_REQUESTS
+        value: "1"
+      - key: REFERRAL_REWARD
+        value: "5"
+      - key: TIMEZONE
+        value: "Asia/Dhaka"
+      - key: SUPPORT_URL
+        value: "https://t.me/QUANTUM_NULL"
