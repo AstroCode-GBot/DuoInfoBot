@@ -3,7 +3,6 @@ import html
 import io
 import json
 import logging
-import math
 import os
 import sys
 import threading
@@ -12,12 +11,8 @@ import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import certifi
-import pytz
 import requests
 from flask import Flask, jsonify
-from pymongo import ASCENDING, DESCENDING, MongoClient
-from pymongo.errors import OperationFailure, PyMongoError, ServerSelectionTimeoutError
 
 import config
 
@@ -31,129 +26,6 @@ logger = logging.getLogger(__name__)
 
 # --- Config Validation ---
 config.validate_config()
-
-# --- Global In-Memory Caches & States ---
-USER_STATES: Dict[int, str] = {}
-STATE_DATA: Dict[int, Dict[str, Any]] = {}
-RATE_LIMITS: Dict[int, float] = {}
-API_CACHE: Dict[str, Tuple[float, dict]] = {}  # uid -> (timestamp, response_data)
-
-# --- Flask Server for Render Health Check ---
-app = Flask(__name__)
-
-@app.route("/")
-@app.route("/health")
-def health_check():
-    return "Duo Bot is running", 200
-
-def run_flask():
-    app.run(host="0.0.0.0", port=config.PORT)
-
-# --- Database Setup (MongoDB Atlas with SSL & URL-Encode Fix) ---
-def connect_mongodb():
-    raw_uri = config.MONGO_URI
-    if not raw_uri:
-        logger.critical("MONGO_URI is missing in configuration!")
-        sys.exit(1)
-
-    # Auto-encode Username and Password if they contain special characters (@, #, $, %, etc.)
-    try:
-        if "://" in raw_uri and "@" in raw_uri:
-            scheme, rest = raw_uri.split("://", 1)
-            auth_and_host = rest.rsplit("@", 1)
-            if len(auth_and_host) == 2 and ":" in auth_and_host[0]:
-                user_pass, host_and_options = auth_and_host
-                username, password = user_pass.split(":", 1)
-                
-                # Unquote first to prevent double encoding, then quote
-                decoded_user = urllib.parse.unquote(username)
-                decoded_pass = urllib.parse.unquote(password)
-                
-                encoded_user = urllib.parse.quote_plus(decoded_user)
-                encoded_pass = urllib.parse.quote_plus(decoded_pass)
-                
-                raw_uri = f"{scheme}://{encoded_user}:{encoded_pass}@{host_and_options}"
-    except Exception as parse_error:
-        logger.warning(f"URI Parsing skipped/failed: {parse_error}")
-
-    try:
-        client = MongoClient(
-            raw_uri,
-            tls=True,
-            tlsCAFile=certifi.where(),
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=10000
-        )
-        # Verify Auth & Connection
-        client.admin.command('ping')
-        logger.info("Successfully connected and authenticated to MongoDB Atlas!")
-        return client
-    except OperationFailure as auth_err:
-        logger.critical(
-            f"MongoDB Authentication Failed ('bad auth'):\n"
-            f"--> Check Username/Password in MongoDB Atlas > Database Access.\n"
-            f"--> Full Error: {auth_err}"
-        )
-        sys.exit(1)
-    except ServerSelectionTimeoutError as timeout_err:
-        logger.critical(
-            f"MongoDB Connection Timeout:\n"
-            f"--> Make sure IP 0.0.0.0/0 is whitelisted in MongoDB Atlas > Network Access.\n"
-            f"--> Full Error: {timeout_err}"
-        )
-        sys.exit(1)
-    except Exception as e:
-        logger.critical(f"Failed to connect to MongoDB Atlas: {e}")
-        sys.exit(1)
-
-mongo_client = connect_mongodb()
-db = mongo_client[config.MONGO_DB_NAME]
-
-# Setup Collections
-db_users = db["users"]
-db_requests = db["requests"]
-db_referrals = db["referrals"]
-db_settings = db["settings"]
-db_admins = db["admins"]
-db_groups = db["groups"]
-db_transactions = db["transactions"]
-
-# Setup Indexes
-try:
-    db_users.create_index([("telegram_id", ASCENDING)], unique=True)
-    db_requests.create_index([("user_id", ASCENDING)])
-    db_requests.create_index([("uid", ASCENDING)])
-    db_referrals.create_index([("referrer_id", ASCENDING)])
-    db_referrals.create_index([("referred_id", ASCENDING)], unique=True)
-    db_groups.create_index([("chat_id", ASCENDING)], unique=True)
-    db_admins.create_index([("telegram_id", ASCENDING)], unique=True)
-
-    # Initialize Global Settings in DB if missing
-    if not db_settings.find_one({"key": "global_config"}):
-        db_settings.insert_one({
-            "key": "global_config",
-            "request_cost": config.REQUEST_COST,
-            "daily_free_requests": config.DAILY_FREE_REQUESTS,
-            "referral_reward": config.REFERRAL_REWARD,
-            "force_sub_channel": config.FORCE_SUB_CHANNEL,
-            "support_url": config.SUPPORT_URL
-        })
-    logger.info("Database indexes and default configurations verified.")
-except Exception as idx_err:
-    logger.error(f"Error setting up indexes: {idx_err}")
-
-# --- Dynamic Settings Helper ---
-def get_db_settings() -> dict:
-    conf = db_settings.find_one({"key": "global_config"})
-    if not conf:
-        return {
-            "request_cost": config.REQUEST_COST,
-            "daily_free_requests": config.DAILY_FREE_REQUESTS,
-            "referral_reward": config.REFERRAL_REWARD,
-            "force_sub_channel": config.FORCE_SUB_CHANNEL,
-            "support_url": config.SUPPORT_URL
-        }
-    return conf
 
 # --- Telegram API Client ---
 session = requests.Session()
@@ -208,12 +80,118 @@ def answer_callback(callback_query_id: str, text: str = None, show_alert: bool =
     return bool(api_call("answerCallbackQuery", payload))
 
 def send_document(chat_id: int, file_data: bytes, filename: str, caption: str = "") -> Optional[dict]:
-    files = {"document": (filename, file_data, "text/csv")}
+    files = {"document": (filename, file_data, "application/json" if filename.endswith('.json') else "text/csv")}
     payload = {"chat_id": chat_id, "caption": caption}
     return api_call("sendDocument", payload, files=files)
 
+# --- TELEGRAM-BASED DATABASE SYSTEM ---
+DB_DATA: Dict[str, Any] = {
+    "users": {},
+    "requests": [],
+    "referrals": [],
+    "settings": {
+        "request_cost": config.REQUEST_COST,
+        "daily_free_requests": config.DAILY_FREE_REQUESTS,
+        "referral_reward": config.REFERRAL_REWARD,
+        "force_sub_channel": config.FORCE_SUB_CHANNEL,
+        "support_url": config.SUPPORT_URL
+    },
+    "admins": [],
+    "groups": {},
+    "transactions": []
+}
+
+LAST_SAVE_TIME = 0
+
+def load_db_from_telegram():
+    global DB_DATA
+    if not config.LOG_GROUP_ID:
+        logger.warning("LOG_GROUP_ID not configured! Telegram Database Persistence disabled.")
+        return
+
+    logger.info("Fetching latest Database Backup from Telegram Channel/Group...")
+    try:
+        # Step 1: Find the latest document in LOG_GROUP_ID using getUpdates or pinned/history if available
+        # Note: We fetch channel/chat history via sending a search or checking channel pinning
+        res = api_call("getChat", {"chat_id": config.LOG_GROUP_ID})
+        if res and "pinned_message" in res and "document" in res["pinned_message"]:
+            doc = res["pinned_message"]["document"]
+            file_id = doc["file_id"]
+            file_info = api_call("getFile", {"file_id": file_id})
+            if file_info and "file_path" in file_info:
+                file_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_info['file_path']}"
+                dl_res = requests.get(file_url, timeout=30)
+                if dl_res.status_code == 200:
+                    DB_DATA = json.loads(dl_res.text)
+                    logger.info("Successfully loaded database backup from Telegram pinned message!")
+                    return
+    except Exception as e:
+        logger.error(f"Failed to restore DB from Telegram: {e}")
+
+    logger.info("Starting with default fresh In-Memory DB.")
+
+def save_db_to_telegram(force=False):
+    global LAST_SAVE_TIME
+    now = time.time()
+    # Save maximum once every 5 seconds to prevent spamming Telegram limits unless forced
+    if not force and (now - LAST_SAVE_TIME < 5):
+        return
+
+    LAST_SAVE_TIME = now
+    if not config.LOG_GROUP_ID:
+        return
+
+    try:
+        json_bytes = json.dumps(DB_DATA, indent=2).encode('utf-8')
+        res = send_document(
+            int(config.LOG_GROUP_ID), 
+            json_bytes, 
+            "database_backup.json", 
+            caption=f"📦 <b>Automated DB Backup</b>\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        # Pin the latest DB backup so it can be restored on reboot
+        if res and "message_id" in res:
+            api_call("pinChatMessage", {
+                "chat_id": config.LOG_GROUP_ID,
+                "message_id": res["message_id"],
+                "disable_notification": True
+            })
+    except Exception as e:
+        logger.error(f"Failed to auto-backup DB to Telegram: {e}")
+
+# Initialize DB Load
+load_db_from_telegram()
+
+# --- Global In-Memory Caches & States ---
+USER_STATES: Dict[int, str] = {}
+STATE_DATA: Dict[int, Dict[str, Any]] = {}
+RATE_LIMITS: Dict[int, float] = {}
+API_CACHE: Dict[str, Tuple[float, dict]] = {}
+
+# --- Flask Server for Render Health Check ---
+app = Flask(__name__)
+
+@app.route("/")
+@app.route("/health")
+def health_check():
+    return "Duo Bot is running", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=config.PORT)
+
+# --- Dynamic Settings Helper ---
+def get_db_settings() -> dict:
+    return DB_DATA.get("settings", {
+        "request_cost": config.REQUEST_COST,
+        "daily_free_requests": config.DAILY_FREE_REQUESTS,
+        "referral_reward": config.REFERRAL_REWARD,
+        "force_sub_channel": config.FORCE_SUB_CHANNEL,
+        "support_url": config.SUPPORT_URL
+    })
+
 # --- Date/Time Helpers ---
 def get_local_now() -> datetime:
+    import pytz
     tz = pytz.timezone(config.TIMEZONE)
     return datetime.now(tz)
 
@@ -224,16 +202,16 @@ def get_today_str() -> str:
 def is_admin(user_id: int) -> bool:
     if str(user_id) == str(config.ADMIN_ID):
         return True
-    return bool(db_admins.find_one({"telegram_id": user_id}))
+    return user_id in DB_DATA.get("admins", [])
 
 def sync_user(user: dict) -> dict:
-    user_id = user["id"]
+    user_id = str(user["id"])
     today = get_today_str()
-    existing = db_users.find_one({"telegram_id": user_id})
+    users = DB_DATA["users"]
     
-    if not existing:
+    if user_id not in users:
         new_user = {
-            "telegram_id": user_id,
+            "telegram_id": user["id"],
             "username": user.get("username", ""),
             "first_name": user.get("first_name", "User"),
             "coins": 0,
@@ -248,24 +226,23 @@ def sync_user(user: dict) -> dict:
             "banned": False,
             "joined_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        db_users.insert_one(new_user)
+        users[user_id] = new_user
+        save_db_to_telegram()
         return new_user
+
+    existing = users[user_id]
 
     # Reset daily free requests if new date
     if existing.get("daily_free_date") != today:
-        db_users.update_one(
-            {"telegram_id": user_id},
-            {"$set": {"daily_free_date": today, "daily_free_used": 0}}
-        )
         existing["daily_free_date"] = today
         existing["daily_free_used"] = 0
+        save_db_to_telegram()
 
     # Sync username/first_name changes
     if existing.get("username") != user.get("username", "") or existing.get("first_name") != user.get("first_name", ""):
-        db_users.update_one(
-            {"telegram_id": user_id},
-            {"$set": {"username": user.get("username", ""), "first_name": user.get("first_name", "")}}
-        )
+        existing["username"] = user.get("username", "")
+        existing["first_name"] = user.get("first_name", "")
+        save_db_to_telegram()
 
     return existing
 
@@ -365,7 +342,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
             send_message(chat_id, msg)
         return
 
-    db_u = db_users.find_one({"telegram_id": user_id})
+    db_u = DB_DATA["users"].get(str(user_id))
     if not db_u:
         return
 
@@ -403,7 +380,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     success, data, err_desc = fetch_duo_info(uid)
 
     if not success:
-        db_requests.insert_one({
+        DB_DATA["requests"].append({
             "user_id": user_id,
             "uid": uid,
             "chat_id": chat_id,
@@ -413,7 +390,9 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
             "used_free": False,
             "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
         })
-        db_users.update_one({"telegram_id": user_id}, {"$inc": {"total_requests": 1, "failed_requests": 1}})
+        db_u["total_requests"] = db_u.get("total_requests", 0) + 1
+        db_u["failed_requests"] = db_u.get("failed_requests", 0) + 1
+        save_db_to_telegram()
 
         log_to_group(f"{config.emoji('warn', '⚠️')} <b>Duo Request Failed</b>\n\n👤 User: <code>{user_id}</code>\n🎯 UID: <code>{uid}</code>\n❌ Reason: {err_desc}")
 
@@ -427,17 +406,16 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     # Success: Deduct payment
     cost_text = "Free"
     if is_free:
-        db_users.update_one(
-            {"telegram_id": user_id},
-            {"$inc": {"daily_free_used": 1, "total_requests": 1, "successful_requests": 1}, "$set": {"daily_free_date": today}}
-        )
+        db_u["daily_free_used"] = db_u.get("daily_free_used", 0) + 1
+        db_u["total_requests"] = db_u.get("total_requests", 0) + 1
+        db_u["successful_requests"] = db_u.get("successful_requests", 0) + 1
+        db_u["daily_free_date"] = today
     else:
-        db_users.update_one(
-            {"telegram_id": user_id},
-            {"$inc": {"coins": -req_cost, "total_requests": 1, "successful_requests": 1}}
-        )
+        db_u["coins"] = db_u.get("coins", 0) - req_cost
+        db_u["total_requests"] = db_u.get("total_requests", 0) + 1
+        db_u["successful_requests"] = db_u.get("successful_requests", 0) + 1
         cost_text = f"{req_cost} Coin"
-        db_transactions.insert_one({
+        DB_DATA["transactions"].append({
             "user_id": user_id,
             "type": "spend",
             "amount": req_cost,
@@ -445,7 +423,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
             "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
         })
 
-    db_requests.insert_one({
+    DB_DATA["requests"].append({
         "user_id": user_id,
         "uid": uid,
         "chat_id": chat_id,
@@ -455,6 +433,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
         "used_free": is_free,
         "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
     })
+    save_db_to_telegram()
 
     # Format Output Result
     p_name = esc(data.get("PlayerName", "N/A"))
@@ -499,29 +478,31 @@ def handle_start(user: dict, chat_id: int, args: str = ""):
     if args.startswith("ref_") and db_u.get("referrer_id") is None:
         try:
             ref_id = int(args.replace("ref_", "").strip())
-            if ref_id != user_id and db_users.find_one({"telegram_id": ref_id}):
+            ref_user = DB_DATA["users"].get(str(ref_id))
+            if ref_id != user_id and ref_user:
                 settings = get_db_settings()
                 ref_reward = settings.get("referral_reward", 5)
 
-                db_users.update_one({"telegram_id": user_id}, {"$set": {"referrer_id": ref_id}})
-                db_users.update_one(
-                    {"telegram_id": ref_id},
-                    {"$inc": {"coins": ref_reward, "referral_count": 1, "referral_earnings": ref_reward}}
-                )
-                db_referrals.insert_one({
+                db_u["referrer_id"] = ref_id
+                ref_user["coins"] = ref_user.get("coins", 0) + ref_reward
+                ref_user["referral_count"] = ref_user.get("referral_count", 0) + 1
+                ref_user["referral_earnings"] = ref_user.get("referral_earnings", 0) + ref_reward
+
+                DB_DATA["referrals"].append({
                     "referrer_id": ref_id,
                     "referred_id": user_id,
                     "reward": ref_reward,
                     "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
                 })
-                db_transactions.insert_one({
+                DB_DATA["transactions"].append({
                     "user_id": ref_id,
                     "type": "referral",
                     "amount": ref_reward,
                     "description": f"Referral reward for inviting {user_id}",
                     "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
                 })
-                
+                save_db_to_telegram()
+
                 send_message(ref_id, f"{config.emoji('gift', '🎁')} <b>New Referral!</b>\n\nSomeone joined using your referral link. You earned <b>{ref_reward} Coins</b>!")
                 log_to_group(f"{config.emoji('gift', '🎁')} <b>Referral Success</b>\n\nReferrer: <code>{ref_id}</code>\nReferred: <code>{user_id}</code>\nReward: <b>{ref_reward} Coins</b>")
         except Exception as e:
@@ -670,8 +651,11 @@ def handle_callback(callback: dict):
         limit = 5
         skip = page * limit
 
-        total_reqs = db_requests.count_documents({"user_id": user_id})
-        reqs = list(db_requests.find({"user_id": user_id}).sort("_id", DESCENDING).skip(skip).limit(limit))
+        user_reqs = [r for r in DB_DATA["requests"] if r.get("user_id") == user_id]
+        user_reqs.reverse() # Newest first
+        
+        total_reqs = len(user_reqs)
+        reqs = user_reqs[skip:skip + limit]
 
         if not reqs:
             edit_message(chat_id, message_id, f"{config.emoji('view', '📊')} <b>Request History</b>\n\nNo request history found.", reply_markup=get_back_keyboard())
@@ -705,8 +689,11 @@ def handle_callback(callback: dict):
         limit = 5
         skip = page * limit
 
-        total_tx = db_transactions.count_documents({"user_id": user_id})
-        txs = list(db_transactions.find({"user_id": user_id}).sort("_id", DESCENDING).skip(skip).limit(limit))
+        user_txs = [t for t in DB_DATA["transactions"] if t.get("user_id") == user_id]
+        user_txs.reverse()
+
+        total_tx = len(user_txs)
+        txs = user_txs[skip:skip + limit]
 
         if not txs:
             edit_message(chat_id, message_id, f"{config.emoji('money', '💰')} <b>Transactions</b>\n\nNo transactions found.", reply_markup=get_back_keyboard("coins"))
@@ -783,23 +770,17 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         edit_message(chat_id, message_id, admin_text, reply_markup=kb)
 
     elif data == "admin_stats":
-        tot_users = db_users.count_documents({})
-        active_users = db_users.count_documents({"banned": False})
-        tot_groups = db_groups.count_documents({})
+        tot_users = len(DB_DATA["users"])
+        active_users = sum(1 for u in DB_DATA["users"].values() if not u.get("banned"))
+        tot_groups = len(DB_DATA["groups"])
 
-        tot_reqs = db_requests.count_documents({})
-        succ_reqs = db_requests.count_documents({"status": "success"})
-        fail_reqs = db_requests.count_documents({"status": "failed"})
+        tot_reqs = len(DB_DATA["requests"])
+        succ_reqs = sum(1 for r in DB_DATA["requests"] if r.get("status") == "success")
+        fail_reqs = sum(1 for r in DB_DATA["requests"] if r.get("status") == "failed")
 
-        pipeline_earned = [{"$match": {"type": {"$in": ["referral", "admin_add"]}}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
-        pipeline_spent = [{"$match": {"type": "spend"}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
-
-        earned_res = list(db_transactions.aggregate(pipeline_earned))
-        spent_res = list(db_transactions.aggregate(pipeline_spent))
-
-        coins_dist = earned_res[0]["total"] if earned_res else 0
-        coins_spent = spent_res[0]["total"] if spent_res else 0
-        tot_refs = db_referrals.count_documents({})
+        coins_dist = sum(t.get("amount", 0) for t in DB_DATA["transactions"] if t.get("type") in ["referral", "admin_add"])
+        coins_spent = sum(t.get("amount", 0) for t in DB_DATA["transactions"] if t.get("type") == "spend")
+        tot_refs = len(DB_DATA["referrals"])
 
         stats_text = (
             f"{config.emoji('view', '📊')} <b>Bot Statistics</b>\n\n"
@@ -820,8 +801,10 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         limit = 5
         skip = page * limit
 
-        tot_u = db_users.count_documents({})
-        users_list = list(db_users.find({}).sort("_id", DESCENDING).skip(skip).limit(limit))
+        all_users = list(DB_DATA["users"].values())
+        all_users.reverse()
+        tot_u = len(all_users)
+        users_list = all_users[skip:skip + limit]
 
         text = f"{config.emoji('user', '👥')} <b>User Management (Page {page + 1})</b>\n\n"
         kb_rows = []
@@ -849,7 +832,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
 
     elif data.startswith("admin_manage_u_"):
         target_uid = int(data.split("_")[3])
-        u = db_users.find_one({"telegram_id": target_uid})
+        u = DB_DATA["users"].get(str(target_uid))
         if not u:
             edit_message(chat_id, message_id, "User not found.", reply_markup=get_back_keyboard("admin_users_0"))
             return
@@ -885,12 +868,16 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
 
     elif data.startswith("admin_ban_"):
         target_uid = int(data.split("_")[2])
-        db_users.update_one({"telegram_id": target_uid}, {"$set": {"banned": True}})
+        if str(target_uid) in DB_DATA["users"]:
+            DB_DATA["users"][str(target_uid)]["banned"] = True
+            save_db_to_telegram()
         handle_admin_callback(user_id, chat_id, message_id, f"admin_manage_u_{target_uid}")
 
     elif data.startswith("admin_unban_"):
         target_uid = int(data.split("_")[2])
-        db_users.update_one({"telegram_id": target_uid}, {"$set": {"banned": False}})
+        if str(target_uid) in DB_DATA["users"]:
+            DB_DATA["users"][str(target_uid)]["banned"] = False
+            save_db_to_telegram()
         handle_admin_callback(user_id, chat_id, message_id, f"admin_manage_u_{target_uid}")
 
     elif data.startswith("admin_addcoins_"):
@@ -958,22 +945,20 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
 
     elif data == "admin_export_users":
         edit_message(chat_id, message_id, "Generating Users CSV...")
-        users = list(db_users.find({}))
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["Telegram ID", "Username", "First Name", "Coins", "Referrals", "Total Requests", "Joined At"])
-        for u in users:
+        for u in DB_DATA["users"].values():
             writer.writerow([u.get("telegram_id"), u.get("username"), u.get("first_name"), u.get("coins"), u.get("referral_count"), u.get("total_requests"), u.get("joined_at")])
 
         send_document(chat_id, output.getvalue().encode('utf-8'), "users.csv", caption="Users Export")
 
     elif data == "admin_export_reqs":
         edit_message(chat_id, message_id, "Generating Requests CSV...")
-        reqs = list(db_requests.find({}))
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["User ID", "UID", "Status", "Cost", "Used Free", "Created At"])
-        for r in reqs:
+        for r in DB_DATA["requests"]:
             writer.writerow([r.get("user_id"), r.get("uid"), r.get("status"), r.get("cost"), r.get("used_free"), r.get("created_at")])
 
         send_document(chat_id, output.getvalue().encode('utf-8'), "requests.csv", caption="Requests Export")
@@ -983,11 +968,10 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
             answer_callback(call_id, "Only the Bot Owner can manage admins.", show_alert=True)
             return
         
-        admins = list(db_admins.find({}))
+        admins = DB_DATA.get("admins", [])
         admin_text = f"{config.emoji('key', '🔐')} <b>Admin Management</b>\n\n<b>Owner ID:</b> <code>{config.ADMIN_ID}</code>\n\n<b>Secondary Admins:</b>\n"
         kb_rows = []
-        for a in admins:
-            aid = a.get("telegram_id")
+        for aid in admins:
             admin_text += f"• <code>{aid}</code>\n"
             kb_rows.append([{"text": f"Remove {aid}", "callback_data": f"admin_remove_admin_{aid}"}])
 
@@ -1005,7 +989,9 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         if str(user_id) != str(config.ADMIN_ID):
             return
         aid = int(data.split("_")[3])
-        db_admins.delete_one({"telegram_id": aid})
+        if aid in DB_DATA.get("admins", []):
+            DB_DATA["admins"].remove(aid)
+            save_db_to_telegram()
         handle_admin_callback(user_id, chat_id, message_id, "admin_manage_admins")
 
 # --- Message Processing Engine ---
@@ -1019,11 +1005,11 @@ def handle_text_message(msg: dict):
 
     # Track Groups
     if chat_type in ["group", "supergroup"]:
-        db_groups.update_one(
-            {"chat_id": chat_id},
-            {"$set": {"title": chat.get("title", "Group"), "updated_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")}},
-            upsert=True
-        )
+        DB_DATA["groups"][str(chat_id)] = {
+            "title": chat.get("title", "Group"),
+            "updated_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        save_db_to_telegram()
 
     db_u = sync_user(from_user)
 
@@ -1087,14 +1073,18 @@ def handle_text_message(msg: dict):
                 send_message(chat_id, "Please enter a valid numeric coin amount.")
                 return
             amt = int(text)
-            db_users.update_one({"telegram_id": target_uid}, {"$inc": {"coins": amt}})
-            db_transactions.insert_one({
-                "user_id": target_uid,
-                "type": "admin_add",
-                "amount": amt,
-                "description": f"Added by admin {user_id}",
-                "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
-            })
+            
+            target_u = DB_DATA["users"].get(str(target_uid))
+            if target_u:
+                target_u["coins"] = target_u.get("coins", 0) + amt
+                DB_DATA["transactions"].append({
+                    "user_id": target_uid,
+                    "type": "admin_add",
+                    "amount": amt,
+                    "description": f"Added by admin {user_id}",
+                    "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                save_db_to_telegram()
             send_message(chat_id, f"Successfully added <b>{amt} Coins</b> to user <code>{target_uid}</code>.")
 
         elif state.startswith("AWAITING_REM_COINS_"):
@@ -1104,7 +1094,11 @@ def handle_text_message(msg: dict):
                 send_message(chat_id, "Please enter a valid numeric coin amount.")
                 return
             amt = int(text)
-            db_users.update_one({"telegram_id": target_uid}, {"$inc": {"coins": -amt}})
+            
+            target_u = DB_DATA["users"].get(str(target_uid))
+            if target_u:
+                target_u["coins"] = max(0, target_u.get("coins", 0) - amt)
+                save_db_to_telegram()
             send_message(chat_id, f"Successfully removed <b>{amt} Coins</b> from user <code>{target_uid}</code>.")
 
         elif state == "AWAITING_NEW_COST":
@@ -1112,7 +1106,8 @@ def handle_text_message(msg: dict):
             if not text.isdigit():
                 send_message(chat_id, "Please enter a valid numeric amount.")
                 return
-            db_settings.update_one({"key": "global_config"}, {"$set": {"request_cost": int(text)}})
+            DB_DATA["settings"]["request_cost"] = int(text)
+            save_db_to_telegram()
             send_message(chat_id, f"Request cost updated to <b>{text} Coins</b>.")
 
         elif state == "AWAITING_NEW_FREE":
@@ -1120,7 +1115,8 @@ def handle_text_message(msg: dict):
             if not text.isdigit():
                 send_message(chat_id, "Please enter a valid numeric amount.")
                 return
-            db_settings.update_one({"key": "global_config"}, {"$set": {"daily_free_requests": int(text)}})
+            DB_DATA["settings"]["daily_free_requests"] = int(text)
+            save_db_to_telegram()
             send_message(chat_id, f"Daily free requests limit updated to <b>{text}</b>.")
 
         elif state == "AWAITING_NEW_REF_REWARD":
@@ -1128,13 +1124,15 @@ def handle_text_message(msg: dict):
             if not text.isdigit():
                 send_message(chat_id, "Please enter a valid numeric amount.")
                 return
-            db_settings.update_one({"key": "global_config"}, {"$set": {"referral_reward": int(text)}})
+            DB_DATA["settings"]["referral_reward"] = int(text)
+            save_db_to_telegram()
             send_message(chat_id, f"Referral reward updated to <b>{text} Coins</b>.")
 
         elif state == "AWAITING_FORCESUB_CHANNEL":
             USER_STATES.pop(user_id, None)
             val = "" if text.lower() == "off" else text
-            db_settings.update_one({"key": "global_config"}, {"$set": {"force_sub_channel": val}})
+            DB_DATA["settings"]["force_sub_channel"] = val
+            save_db_to_telegram()
             send_message(chat_id, f"Force sub channel updated to: <code>{val if val else 'Disabled'}</code>")
 
         elif state == "AWAITING_ADD_ADMIN_ID":
@@ -1143,7 +1141,9 @@ def handle_text_message(msg: dict):
                 send_message(chat_id, "Please enter a valid numeric Telegram ID.")
                 return
             aid = int(text)
-            db_admins.update_one({"telegram_id": aid}, {"$set": {"added_by": user_id}}, upsert=True)
+            if aid not in DB_DATA.get("admins", []):
+                DB_DATA.setdefault("admins", []).append(aid)
+                save_db_to_telegram()
             send_message(chat_id, f"User <code>{aid}</code> has been added as Admin.")
 
         elif state == "AWAITING_BROADCAST_TEXT":
@@ -1181,7 +1181,7 @@ def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
     STATE_DATA.pop(user_id, None)
 
     send_message(chat_id, "🚀 Starting broadcast...")
-    users = list(db_users.find({}, {"telegram_id": 1}))
+    users = list(DB_DATA["users"].values())
 
     success = 0
     failed = 0
