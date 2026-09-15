@@ -534,28 +534,92 @@ def log_to_group(text: str):
 
 # --- Core Business Logic: Duo API ---
 def fetch_duo_info(uid: str) -> Tuple[bool, Optional[dict], str]:
+    """Fetch Duo information without changing the existing API contract.
+
+    The API is expected to be: /api/duo?uid=<UID>.  This handler is deliberately
+    tolerant of harmless response-format differences and gives useful diagnostics
+    instead of incorrectly reporting a healthy API as offline.
+    """
     now = time.time()
-    if uid in API_CACHE:
-        cache_time, cache_data = API_CACHE[uid]
+    cached = API_CACHE.get(uid)
+    if cached:
+        cache_time, cache_data = cached
         if now - cache_time < 30:
             return True, cache_data, "cache"
 
+    url = str(config.DUO_API_URL).strip()
+    if not url:
+        return False, None, "Duo API URL is not configured."
+
     try:
-        resp = requests.get(config.DUO_API_URL, params={"uid": uid}, timeout=15)
-        if resp.status_code != 200:
-            return False, None, "API returns error or is offline."
-        
-        data = resp.json()
-        if not data or "PlayerName" not in data or not data.get("PlayerName"):
+        # Keep the exact existing API format: ?uid=UID
+        resp = requests.get(
+            url,
+            params={"uid": str(uid)},
+            headers={"Accept": "application/json", "User-Agent": "DuoInfoBot/2.0"},
+            timeout=(10, 30),
+        )
+
+        logger.info("Duo API: %s?uid=%s -> HTTP %s", url, uid, resp.status_code)
+
+        if not (200 <= resp.status_code < 300):
+            body = (resp.text or "").strip().replace("\n", " ")[:300]
+            logger.error("Duo API HTTP error %s: %s", resp.status_code, body)
+            return False, None, f"Duo API returned HTTP {resp.status_code}."
+
+        # Some APIs occasionally return an empty body while the server is alive.
+        if not resp.text or not resp.text.strip():
+            return False, None, "Duo API returned an empty response."
+
+        try:
+            data = resp.json()
+        except ValueError:
+            body = resp.text.strip()[:300]
+            logger.error("Duo API returned non-JSON response: %s", body)
+            return False, None, "Duo API returned invalid JSON."
+
+        # Accept a normal object and also common wrapper formats such as
+        # {"data": {...}} / {"result": {...}} without changing the API itself.
+        if isinstance(data, dict):
+            for key in ("data", "result", "response"):
+                nested = data.get(key)
+                if isinstance(nested, dict) and (
+                    "PlayerName" in nested or "PlayerUID" in nested or "DuoPartnerName" in nested
+                ):
+                    data = nested
+                    break
+        else:
+            logger.error("Duo API JSON type was %s, expected object", type(data).__name__)
+            return False, None, "Duo API returned an unexpected response format."
+
+        # Do NOT require PlayerName specifically. PlayerUID is enough to identify
+        # a valid Duo response, and this prevents false failures when a name is empty.
+        if not data:
             return False, None, "No Duo information found for this UID."
+
+        known_keys = {"PlayerName", "PlayerUID", "DuoPartnerName"}
+        if not any(k in data for k in known_keys):
+            logger.error("Unexpected Duo API JSON keys: %s", list(data.keys())[:30])
+            return False, None, "Duo API returned an unexpected data format."
 
         API_CACHE[uid] = (now, data)
         return True, data, "live"
-    except requests.exceptions.Timeout:
-        return False, None, "Duo API request timed out."
+
+    except requests.exceptions.ConnectTimeout:
+        logger.error("Duo API connect timeout: %s", url)
+        return False, None, "Could not connect to Duo API."
+    except requests.exceptions.ReadTimeout:
+        logger.error("Duo API read timeout: %s", url)
+        return False, None, "Duo API took too long to respond."
+    except requests.exceptions.ConnectionError as e:
+        logger.error("Duo API connection error: %s", e)
+        return False, None, "Could not connect to Duo API."
+    except requests.exceptions.RequestException as e:
+        logger.error("Duo API request error: %s", e)
+        return False, None, "Duo API request failed."
     except Exception as e:
-        logger.error(f"Duo API Request Exception: {e}")
-        return False, None, "Failed to connect to Duo API."
+        logger.exception("Unexpected Duo API error: %s", e)
+        return False, None, "Unexpected Duo API error."
 
 # --- Duo Processing Core Handler ---
 def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Optional[int] = None):
