@@ -1,6 +1,7 @@
 import csv
 import html
 import io
+import json
 import logging
 import math
 import os
@@ -121,6 +122,9 @@ def api_call(method: str, payload: dict = None, files: dict = None) -> Optional[
         logger.error(f"HTTP Error calling Telegram API [{method}]: {e}")
         return None
 
+def json_dumps(data: Any) -> str:
+    return json.dumps(data)
+
 def send_message(chat_id: int, text: str, reply_markup: dict = None, parse_mode: str = "HTML") -> Optional[dict]:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
@@ -147,10 +151,6 @@ def send_document(chat_id: int, file_data: bytes, filename: str, caption: str = 
     payload = {"chat_id": chat_id, "caption": caption}
     return api_call("sendDocument", payload, files=files)
 
-import json
-def json_dumps(data: Any) -> str:
-    return json.dumps(data)
-
 def esc(text: Any) -> str:
     if text is None:
         return ""
@@ -158,7 +158,7 @@ def esc(text: Any) -> str:
 
 # --- Date/Time Helpers ---
 def get_local_now() -> datetime:
-    tz = pytz.timezone(config.TIMEZONE)
+    tz = pytz.timezone(config.TIMEZONE_STR)
     return datetime.now(tz)
 
 def get_today_str() -> str:
@@ -166,7 +166,9 @@ def get_today_str() -> str:
 
 # --- Access Control & DB User Sync ---
 def is_admin(user_id: int) -> bool:
-    if str(user_id) == str(config.ADMIN_ID):
+    if user_id in getattr(config, 'ADMIN_IDS', []):
+        return True
+    if str(user_id) == str(getattr(config, 'ADMIN_ID', None)):
         return True
     return bool(db_admins.find_one({"telegram_id": user_id}))
 
@@ -237,8 +239,8 @@ def get_force_sub_keyboard() -> dict:
 
     return {
         "inline_keyboard": [
-            [{"text": f"{config.emoji('join', '📢')} Join Channel", "url": url, "icon_custom_emoji_id": config.PEM["join"], "style": "primary"}],
-            [{"text": f"{config.emoji('check', '✅')} I've Joined", "callback_data": "check_sub", "icon_custom_emoji_id": config.PEM["check"], "style": "success"}]
+            [{"text": "📢 Join Channel", "url": url}],
+            [{"text": "✅ I've Joined", "callback_data": "check_sub"}]
         ]
     }
 
@@ -246,26 +248,26 @@ def get_force_sub_keyboard() -> dict:
 def get_main_keyboard(user_id: int) -> dict:
     rows = [
         [
-            {"text": f"{config.emoji('target', '🔎')} Check Duo", "callback_data": "check_duo", "icon_custom_emoji_id": config.PEM["target"], "style": "primary"},
-            {"text": f"{config.emoji('money', '💰')} Coins", "callback_data": "coins", "icon_custom_emoji_id": config.PEM["money"]}
+            {"text": "🔎 Check Duo", "callback_data": "check_duo"},
+            {"text": "💰 Coins", "callback_data": "coins"}
         ],
         [
-            {"text": f"{config.emoji('gift', '🎁')} Referral", "callback_data": "referral", "icon_custom_emoji_id": config.PEM["gift"]},
-            {"text": f"{config.emoji('user', '👤')} Profile", "callback_data": "profile", "icon_custom_emoji_id": config.PEM["user"]}
+            {"text": "🎁 Referral", "callback_data": "referral"},
+            {"text": "👤 Profile", "callback_data": "profile"}
         ],
         [
-            {"text": f"{config.emoji('view', '📊')} History", "callback_data": "history_0", "icon_custom_emoji_id": config.PEM["view"]},
-            {"text": f"{config.emoji('msg', '💬')} Support", "callback_data": "support", "icon_custom_emoji_id": config.PEM["msg"]}
+            {"text": "📊 History", "callback_data": "history_0"},
+            {"text": "💬 Support", "callback_data": "support"}
         ]
     ]
     if is_admin(user_id):
-        rows.append([{"text": f"{config.emoji('crown', '👑')} Admin Panel", "callback_data": "admin_panel", "icon_custom_emoji_id": config.PEM["crown"], "style": "primary"}])
+        rows.append([{"text": "👑 Admin Panel", "callback_data": "admin_panel"}])
     return {"inline_keyboard": rows}
 
 def get_back_keyboard(target: str = "main_menu") -> dict:
     return {
         "inline_keyboard": [
-            [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": target}]
+            [{"text": "🔙 Back", "callback_data": target}]
         ]
     }
 
@@ -302,9 +304,8 @@ def fetch_duo_info(uid: str) -> Tuple[bool, Optional[dict], str]:
 
 # --- Duo Processing Core Handler ---
 def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Optional[int] = None):
-    # Validate UID
     if not uid.isdigit() or len(uid) < 5 or len(uid) > 15:
-        msg = f"{config.emoji('warn', '⚠️')} <b>Invalid UID.</b>\nPlease send a valid numeric UID."
+        msg = "⚠️ <b>Invalid UID.</b>\nPlease send a valid numeric UID."
         if loading_msg_id:
             edit_message(chat_id, loading_msg_id, msg, reply_markup=get_back_keyboard())
         else:
@@ -316,7 +317,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
         return
 
     if db_u.get("banned", False):
-        msg = f"{config.emoji('no', '🚫')} You are currently banned from using this bot."
+        msg = "🚫 You are currently banned from using this bot."
         if loading_msg_id:
             edit_message(chat_id, loading_msg_id, msg)
         else:
@@ -338,7 +339,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
         is_free = True
     else:
         if db_u.get("coins", 0) < req_cost:
-            msg = f"{config.emoji('warn', '⚠️')} <b>Insufficient Coins!</b>\n\nThis request costs <b>{req_cost} Coin(s)</b>.\nYour Balance: <b>{db_u.get('coins', 0)} Coins</b>.\n\nEarn free coins by inviting friends using the Referral option."
+            msg = f"⚠️ <b>Insufficient Coins!</b>\n\nThis request costs <b>{req_cost} Coin(s)</b>.\nYour Balance: <b>{db_u.get('coins', 0)} Coins</b>.\n\nEarn free coins by inviting friends using the Referral option."
             if loading_msg_id:
                 edit_message(chat_id, loading_msg_id, msg, reply_markup=get_back_keyboard())
             else:
@@ -349,7 +350,6 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     success, data, err_desc = fetch_duo_info(uid)
 
     if not success:
-        # Save failed request log
         db_requests.insert_one({
             "user_id": user_id,
             "uid": uid,
@@ -362,16 +362,16 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
         })
         db_users.update_one({"telegram_id": user_id}, {"$inc": {"total_requests": 1, "failed_requests": 1}})
 
-        log_to_group(f"{config.emoji('warn', '⚠️')} <b>Duo Request Failed</b>\n\n👤 User: <code>{user_id}</code>\n🎯 UID: <code>{uid}</code>\n❌ Reason: {err_desc}")
+        log_to_group(f"⚠️ <b>Duo Request Failed</b>\n\n👤 User: <code>{user_id}</code>\n🎯 UID: <code>{uid}</code>\n❌ Reason: {err_desc}")
 
-        msg = f"{config.emoji('no', '❌')} <b>Request Failed</b>\n\n{err_desc}"
+        msg = f"❌ <b>Request Failed</b>\n\n{err_desc}"
         if loading_msg_id:
             edit_message(chat_id, loading_msg_id, msg, reply_markup=get_back_keyboard())
         else:
             send_message(chat_id, msg)
         return
 
-    # Success: Deduct payment now
+    # Success: Deduct payment
     cost_text = "Free"
     if is_free:
         db_users.update_one(
@@ -415,11 +415,11 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     d_created = esc(data.get("DuoCreationDate", "N/A"))
 
     res_msg = (
-        f"{config.emoji('target', '🔎')} <b>Duo Information</b>\n\n"
-        f"{config.emoji('user', '👤')} <b>Player</b>\n"
+        f"🔎 <b>Duo Information</b>\n\n"
+        f"👤 <b>Player</b>\n"
         f"Name: <code>{p_name}</code>\n"
         f"UID: <code>{p_uid}</code>\n\n"
-        f"{config.emoji('group', '🤝')} <b>Duo Partner</b>\n"
+        f"🤝 <b>Duo Partner</b>\n"
         f"Name: <code>{d_name}</code>\n"
         f"UID: <code>{d_uid}</code>\n\n"
         f"⭐ Duo Level: <b>{d_level}</b>\n"
@@ -427,7 +427,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
         f"🏆 Duo Score: <b>{d_score}</b>\n"
         f"🟢 Status: <b>{d_status}</b>\n"
         f"🗓 Created: <b>{d_created}</b>\n\n"
-        f"{config.emoji('money', '💰')} Request: <b>{cost_text}</b>"
+        f"💰 Request: <b>{cost_text}</b>"
     )
 
     if loading_msg_id:
@@ -435,7 +435,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     else:
         send_message(chat_id, res_msg)
 
-    log_to_group(f"{config.emoji('target', '🔎')} <b>Duo Request Success</b>\n\n👤 User ID: <code>{user_id}</code>\n🎯 UID: <code>{uid}</code>\n📍 Chat ID: <code>{chat_id}</code>\n💰 Cost: <b>{cost_text}</b>")
+    log_to_group(f"🔎 <b>Duo Request Success</b>\n\n👤 User ID: <code>{user_id}</code>\n🎯 UID: <code>{uid}</code>\n📍 Chat ID: <code>{chat_id}</code>\n💰 Cost: <b>{cost_text}</b>")
 
 # --- Command & Interaction Handlers ---
 def handle_start(user: dict, chat_id: int, args: str = ""):
@@ -469,21 +469,21 @@ def handle_start(user: dict, chat_id: int, args: str = ""):
                     "created_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
                 })
                 
-                send_message(ref_id, f"{config.emoji('gift', '🎁')} <b>New Referral!</b>\n\nSomeone joined using your referral link. You earned <b>{ref_reward} Coins</b>!")
-                log_to_group(f"{config.emoji('gift', '🎁')} <b>Referral Success</b>\n\nReferrer: <code>{ref_id}</code>\nReferred: <code>{user_id}</code>\nReward: <b>{ref_reward} Coins</b>")
+                send_message(ref_id, f"🎁 <b>New Referral!</b>\n\nSomeone joined using your referral link. You earned <b>{ref_reward} Coins</b>!")
+                log_to_group(f"🎁 <b>Referral Success</b>\n\nReferrer: <code>{ref_id}</code>\nReferred: <code>{user_id}</code>\nReward: <b>{ref_reward} Coins</b>")
         except Exception as e:
             logger.error(f"Referral Error: {e}")
 
     if not check_force_sub(user_id):
-        send_message(chat_id, f"{config.emoji('warn', '⚠️')} <b>Please join our official channel to use this bot.</b>", reply_markup=get_force_sub_keyboard())
+        send_message(chat_id, "⚠️ <b>Please join our official channel to use this bot.</b>", reply_markup=get_force_sub_keyboard())
         return
 
     welcome_text = (
-        f"{config.emoji('hi', '👋')} <b>Welcome to Duo Info Bot</b>\n\n"
-        f"{config.emoji('target', '🔎')} Check Duo information instantly\n"
-        f"{config.emoji('rocket', '⚡')} Fast API response\n"
-        f"{config.emoji('gift', '🎁')} Daily free request\n"
-        f"{config.emoji('money', '💰')} Referral rewards\n\n"
+        f"👋 <b>Welcome to Duo Info Bot</b>\n\n"
+        f"🔎 Check Duo information instantly\n"
+        f"⚡ Fast API response\n"
+        f"🎁 Daily free request\n"
+        f"💰 Referral rewards\n\n"
         f"Choose an option below."
     )
     send_message(chat_id, welcome_text, reply_markup=get_main_keyboard(user_id))
@@ -503,7 +503,6 @@ def handle_callback(callback: dict):
         answer_callback(call_id, "You are banned from using this bot.", show_alert=True)
         return
 
-    # --- Force Sub Check Callback ---
     if data == "check_sub":
         if check_force_sub(user_id):
             answer_callback(call_id, "Thank you for joining!")
@@ -514,26 +513,23 @@ def handle_callback(callback: dict):
             answer_callback(call_id, "You have not joined the channel yet!", show_alert=True)
         return
 
-    # Check force sub for general navigation
     if not check_force_sub(user_id):
         answer_callback(call_id, "Please join our channel first!", show_alert=True)
-        send_message(chat_id, f"{config.emoji('warn', '⚠️')} <b>Please join our official channel to use this bot.</b>", reply_markup=get_force_sub_keyboard())
+        send_message(chat_id, "⚠️ <b>Please join our official channel to use this bot.</b>", reply_markup=get_force_sub_keyboard())
         return
 
     answer_callback(call_id)
 
-    # Clean State
     if user_id in USER_STATES and not data.startswith("admin_"):
         USER_STATES.pop(user_id, None)
 
-    # --- Menu Navigation ---
     if data == "main_menu":
         welcome_text = (
-            f"{config.emoji('hi', '👋')} <b>Welcome to Duo Info Bot</b>\n\n"
-            f"{config.emoji('target', '🔎')} Check Duo information instantly\n"
-            f"{config.emoji('rocket', '⚡')} Fast API response\n"
-            f"{config.emoji('gift', '🎁')} Daily free request\n"
-            f"{config.emoji('money', '💰')} Referral rewards\n\n"
+            f"👋 <b>Welcome to Duo Info Bot</b>\n\n"
+            f"🔎 Check Duo information instantly\n"
+            f"⚡ Fast API response\n"
+            f"🎁 Daily free request\n"
+            f"💰 Referral rewards\n\n"
             f"Choose an option below."
         )
         edit_message(chat_id, message_id, welcome_text, reply_markup=get_main_keyboard(user_id))
@@ -542,10 +538,10 @@ def handle_callback(callback: dict):
         USER_STATES[user_id] = "AWAITING_UID"
         kb = {
             "inline_keyboard": [
-                [{"text": f"{config.emoji('no', '❌')} Cancel", "callback_data": "main_menu"}]
+                [{"text": "❌ Cancel", "callback_data": "main_menu"}]
             ]
         }
-        edit_message(chat_id, message_id, f"{config.emoji('target', '🎯')} <b>Send the Player UID</b>\n\nPlease type and send the Free Fire / Duo numeric UID below:", reply_markup=kb)
+        edit_message(chat_id, message_id, "🎯 <b>Send the Player UID</b>\n\nPlease type and send the Free Fire / Duo numeric UID below:", reply_markup=kb)
 
     elif data == "profile":
         t_id = db_u.get("telegram_id")
@@ -561,12 +557,12 @@ def handle_callback(callback: dict):
         free_left = max(0, daily_limit - daily_used)
 
         prof_text = (
-            f"{config.emoji('user', '👤')} <b>Your Profile</b>\n\n"
+            f"👤 <b>Your Profile</b>\n\n"
             f"🆔 Telegram ID: <code>{t_id}</code>\n"
             f"👤 Username: {u_name}\n"
-            f"{config.emoji('money', '💰')} Coins Balance: <b>{coins}</b>\n"
-            f"{config.emoji('gift', '🎁')} Referrals: <b>{refs}</b>\n"
-            f"{config.emoji('target', '🔎')} Total Requests: <b>{tot_req}</b>\n"
+            f"💰 Coins Balance: <b>{coins}</b>\n"
+            f"🎁 Referrals: <b>{refs}</b>\n"
+            f"🔎 Total Requests: <b>{tot_req}</b>\n"
             f"🆓 Free Requests Today: <b>{free_left} / {daily_limit}</b>\n"
             f"📅 Joined: <b>{joined}</b>"
         )
@@ -578,16 +574,16 @@ def handle_callback(callback: dict):
         free_req = settings.get("daily_free_requests", 1)
 
         coins_text = (
-            f"{config.emoji('money', '💰')} <b>Your Coins</b>\n\n"
+            f"💰 <b>Your Coins</b>\n\n"
             f"💎 Balance: <b>{db_u.get('coins', 0)} Coins</b>\n\n"
             f"🆓 Daily Free Requests: <b>{free_req}</b>\n"
-            f"{config.emoji('money', '💰')} Request Cost: <b>{req_c} Coin(s)</b>"
+            f"💰 Request Cost: <b>{req_c} Coin(s)</b>"
         )
         kb = {
             "inline_keyboard": [
-                [{"text": f"{config.emoji('gift', '🎁')} Earn Coins", "callback_data": "referral"}],
-                [{"text": f"{config.emoji('view', '📊')} Transactions", "callback_data": "transactions_0"}],
-                [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "main_menu"}]
+                [{"text": "🎁 Earn Coins", "callback_data": "referral"}],
+                [{"text": "📊 Transactions", "callback_data": "transactions_0"}],
+                [{"text": "🔙 Back", "callback_data": "main_menu"}]
             ]
         }
         edit_message(chat_id, message_id, coins_text, reply_markup=kb)
@@ -601,17 +597,17 @@ def handle_callback(callback: dict):
         reward = settings.get("referral_reward", 5)
 
         ref_text = (
-            f"{config.emoji('gift', '🎁')} <b>Referral Program</b>\n\n"
+            f"🎁 <b>Referral Program</b>\n\n"
             f"Invite your friends and earn <b>{reward} Coins</b> per referral!\n\n"
             f"🔗 <b>Your Referral Link:</b>\n<code>{ref_link}</code>\n\n"
             f"👥 Total Referrals: <b>{db_u.get('referral_count', 0)}</b>\n"
-            f"{config.emoji('money', '💰')} Coins Earned: <b>{db_u.get('referral_earnings', 0)}</b>"
+            f"💰 Coins Earned: <b>{db_u.get('referral_earnings', 0)}</b>"
         )
         share_url = f"https://t.me/share/url?url={ref_link}&text=Check%20your%20Free%20Fire%20Duo%20Info%20instantly!"
         kb = {
             "inline_keyboard": [
-                [{"text": f"{config.emoji('rocket', '📤')} Share Link", "url": share_url}],
-                [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "main_menu"}]
+                [{"text": "📤 Share Link", "url": share_url}],
+                [{"text": "🔙 Back", "callback_data": "main_menu"}]
             ]
         }
         edit_message(chat_id, message_id, ref_text, reply_markup=kb)
@@ -625,10 +621,10 @@ def handle_callback(callback: dict):
         reqs = list(db_requests.find({"user_id": user_id}).sort("_id", DESCENDING).skip(skip).limit(limit))
 
         if not reqs:
-            edit_message(chat_id, message_id, f"{config.emoji('view', '📊')} <b>Request History</b>\n\nNo request history found.", reply_markup=get_back_keyboard())
+            edit_message(chat_id, message_id, "📊 <b>Request History</b>\n\nNo request history found.", reply_markup=get_back_keyboard())
             return
 
-        hist_text = f"{config.emoji('view', '📊')} <b>Request History (Page {page + 1})</b>\n\n"
+        hist_text = f"📊 <b>Request History (Page {page + 1})</b>\n\n"
         for r in reqs:
             st = "🟢 Success" if r.get("status") == "success" else "❌ Failed"
             c = "Free" if r.get("used_free") else f"{r.get('cost', 0)} Coin(s)"
@@ -647,7 +643,7 @@ def handle_callback(callback: dict):
         rows = []
         if nav_btns:
             rows.append(nav_btns)
-        rows.append([{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "main_menu"}])
+        rows.append([{"text": "🔙 Back", "callback_data": "main_menu"}])
 
         edit_message(chat_id, message_id, hist_text, reply_markup={"inline_keyboard": rows})
 
@@ -660,10 +656,10 @@ def handle_callback(callback: dict):
         txs = list(db_transactions.find({"user_id": user_id}).sort("_id", DESCENDING).skip(skip).limit(limit))
 
         if not txs:
-            edit_message(chat_id, message_id, f"{config.emoji('money', '💰')} <b>Transactions</b>\n\nNo transactions found.", reply_markup=get_back_keyboard("coins"))
+            edit_message(chat_id, message_id, "💰 <b>Transactions</b>\n\nNo transactions found.", reply_markup=get_back_keyboard("coins"))
             return
 
-        tx_text = f"{config.emoji('money', '💰')} <b>Transaction History (Page {page + 1})</b>\n\n"
+        tx_text = f"💰 <b>Transaction History (Page {page + 1})</b>\n\n"
         for t in txs:
             t_type = "➕ Earned" if t.get("type") in ["referral", "admin_add"] else "➖ Spent"
             tx_text += (
@@ -681,23 +677,22 @@ def handle_callback(callback: dict):
         rows = []
         if nav_btns:
             rows.append(nav_btns)
-        rows.append([{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "coins"}])
+        rows.append([{"text": "🔙 Back", "callback_data": "coins"}])
 
         edit_message(chat_id, message_id, tx_text, reply_markup={"inline_keyboard": rows})
 
     elif data == "support":
         settings = get_db_settings()
         sup_url = settings.get("support_url", config.SUPPORT_URL)
-        sup_text = f"{config.emoji('msg', '💬')} <b>Support</b>\n\nNeed help or facing issues with the bot? Contact our support team below."
+        sup_text = "💬 <b>Support</b>\n\nNeed help or facing issues with the bot? Contact our support team below."
         kb = {
             "inline_keyboard": [
-                [{"text": f"{config.emoji('msg', '💬')} Contact Support", "url": sup_url}],
-                [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "main_menu"}]
+                [{"text": "💬 Contact Support", "url": sup_url}],
+                [{"text": "🔙 Back", "callback_data": "main_menu"}]
             ]
         }
         edit_message(chat_id, message_id, sup_text, reply_markup=kb)
 
-    # --- ADMIN PANEL CALLS ---
     elif data.startswith("admin_"):
         if not is_admin(user_id):
             answer_callback(call_id, "❌ Not authorized.", show_alert=True)
@@ -707,29 +702,29 @@ def handle_callback(callback: dict):
 # --- Admin Panel Callback Handler ---
 def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str):
     if data == "admin_panel":
-        admin_text = f"{config.emoji('crown', '👑')} <b>Admin Panel</b>\n\nSelect an administrative option:"
+        admin_text = "👑 <b>Admin Panel</b>\n\nSelect an administrative option:"
         kb = {
             "inline_keyboard": [
                 [
-                    {"text": f"{config.emoji('user', '👥')} Users", "callback_data": "admin_users_0"},
-                    {"text": f"{config.emoji('view', '📊')} Statistics", "callback_data": "admin_stats"}
+                    {"text": "👥 Users", "callback_data": "admin_users_0"},
+                    {"text": "📊 Statistics", "callback_data": "admin_stats"}
                 ],
                 [
-                    {"text": f"{config.emoji('money', '💰')} Coin Settings", "callback_data": "admin_coin_settings"},
-                    {"text": f"{config.emoji('gift', '🎁')} Referral Settings", "callback_data": "admin_ref_settings"}
+                    {"text": "💰 Coin Settings", "callback_data": "admin_coin_settings"},
+                    {"text": "🎁 Referral Settings", "callback_data": "admin_ref_settings"}
                 ],
                 [
-                    {"text": f"{config.emoji('bell', '📢')} Broadcast", "callback_data": "admin_broadcast_prompt"},
-                    {"text": f"{config.emoji('join', '📢')} Force Sub", "callback_data": "admin_forcesub_prompt"}
+                    {"text": "📢 Broadcast", "callback_data": "admin_broadcast_prompt"},
+                    {"text": "📢 Force Sub", "callback_data": "admin_forcesub_prompt"}
                 ],
                 [
-                    {"text": f"{config.emoji('rocket', '📤')} Export Users CSV", "callback_data": "admin_export_users"},
-                    {"text": f"{config.emoji('rocket', '📤')} Export Requests CSV", "callback_data": "admin_export_reqs"}
+                    {"text": "📤 Export Users CSV", "callback_data": "admin_export_users"},
+                    {"text": "📤 Export Requests CSV", "callback_data": "admin_export_reqs"}
                 ],
                 [
-                    {"text": f"{config.emoji('key', '🔐')} Manage Admins", "callback_data": "admin_manage_admins"}
+                    {"text": "🔐 Manage Admins", "callback_data": "admin_manage_admins"}
                 ],
-                [{"text": f"{config.emoji('no', '🔙')} Exit Admin", "callback_data": "main_menu"}]
+                [{"text": "🔙 Exit Admin", "callback_data": "main_menu"}]
             ]
         }
         edit_message(chat_id, message_id, admin_text, reply_markup=kb)
@@ -743,7 +738,6 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         succ_reqs = db_requests.count_documents({"status": "success"})
         fail_reqs = db_requests.count_documents({"status": "failed"})
 
-        # Aggregations
         pipeline_earned = [{"$match": {"type": {"$in": ["referral", "admin_add"]}}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
         pipeline_spent = [{"$match": {"type": "spend"}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
 
@@ -755,7 +749,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         tot_refs = db_referrals.count_documents({})
 
         stats_text = (
-            f"{config.emoji('view', '📊')} <b>Bot Statistics</b>\n\n"
+            f"📊 <b>Bot Statistics</b>\n\n"
             f"👥 Total Users: <b>{tot_users}</b>\n"
             f"🟢 Active Users: <b>{active_users}</b>\n"
             f"👥 Total Groups: <b>{tot_groups}</b>\n\n"
@@ -776,7 +770,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         tot_u = db_users.count_documents({})
         users_list = list(db_users.find({}).sort("_id", DESCENDING).skip(skip).limit(limit))
 
-        text = f"{config.emoji('user', '👥')} <b>User Management (Page {page + 1})</b>\n\n"
+        text = f"👥 <b>User Management (Page {page + 1})</b>\n\n"
         kb_rows = []
 
         for u in users_list:
@@ -797,7 +791,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         if nav:
             kb_rows.append(nav)
 
-        kb_rows.append([{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "admin_panel"}])
+        kb_rows.append([{"text": "🔙 Back", "callback_data": "admin_panel"}])
         edit_message(chat_id, message_id, text, reply_markup={"inline_keyboard": kb_rows})
 
     elif data.startswith("admin_manage_u_"):
@@ -808,9 +802,9 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
             return
 
         ban_btn = (
-            {"text": f"{config.emoji('ok', '✅')} Unban User", "callback_data": f"admin_unban_{target_uid}"}
+            {"text": "✅ Unban User", "callback_data": f"admin_unban_{target_uid}"}
             if u.get("banned")
-            else {"text": f"{config.emoji('no', '🚫')} Ban User", "callback_data": f"admin_ban_{target_uid}"}
+            else {"text": "🚫 Ban User", "callback_data": f"admin_ban_{target_uid}"}
         )
 
         u_text = (
@@ -827,11 +821,11 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         kb = {
             "inline_keyboard": [
                 [
-                    {"text": f"{config.emoji('add', '➕')} Add Coins", "callback_data": f"admin_addcoins_{target_uid}"},
-                    {"text": f"{config.emoji('rem', '➖')} Remove Coins", "callback_data": f"admin_remcoins_{target_uid}"}
+                    {"text": "➕ Add Coins", "callback_data": f"admin_addcoins_{target_uid}"},
+                    {"text": "➖ Remove Coins", "callback_data": f"admin_remcoins_{target_uid}"}
                 ],
                 [ban_btn],
-                [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "admin_users_0"}]
+                [{"text": "🔙 Back", "callback_data": "admin_users_0"}]
             ]
         }
         edit_message(chat_id, message_id, u_text, reply_markup=kb)
@@ -862,7 +856,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         free_req = settings.get("daily_free_requests", 1)
 
         text = (
-            f"{config.emoji('money', '💰')} <b>Coin Settings</b>\n\n"
+            f"💰 <b>Coin Settings</b>\n\n"
             f"💰 Current Request Cost: <b>{cost} Coin(s)</b>\n"
             f"🆓 Daily Free Requests: <b>{free_req}</b>"
         )
@@ -870,7 +864,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
             "inline_keyboard": [
                 [{"text": "Change Request Cost", "callback_data": "admin_set_cost"}],
                 [{"text": "Change Daily Free Limit", "callback_data": "admin_set_free"}],
-                [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "admin_panel"}]
+                [{"text": "🔙 Back", "callback_data": "admin_panel"}]
             ]
         }
         edit_message(chat_id, message_id, text, reply_markup=kb)
@@ -886,11 +880,11 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
     elif data == "admin_ref_settings":
         settings = get_db_settings()
         reward = settings.get("referral_reward", 5)
-        text = f"{config.emoji('gift', '🎁')} <b>Referral Settings</b>\n\nCurrent Referral Reward: <b>{reward} Coins</b>"
+        text = f"🎁 <b>Referral Settings</b>\n\nCurrent Referral Reward: <b>{reward} Coins</b>"
         kb = {
             "inline_keyboard": [
                 [{"text": "Change Reward Amount", "callback_data": "admin_set_ref_reward"}],
-                [{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "admin_panel"}]
+                [{"text": "🔙 Back", "callback_data": "admin_panel"}]
             ]
         }
         edit_message(chat_id, message_id, text, reply_markup=kb)
@@ -901,7 +895,7 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
 
     elif data == "admin_broadcast_prompt":
         USER_STATES[user_id] = "AWAITING_BROADCAST_TEXT"
-        edit_message(chat_id, message_id, f"{config.emoji('bell', '📢')} Send the message you want to broadcast to all users:", reply_markup=get_back_keyboard("admin_panel"))
+        edit_message(chat_id, message_id, "📢 Send the message you want to broadcast to all users:", reply_markup=get_back_keyboard("admin_panel"))
 
     elif data == "admin_forcesub_prompt":
         settings = get_db_settings()
@@ -932,31 +926,23 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         send_document(chat_id, output.getvalue().encode('utf-8'), "requests.csv", caption="Requests Export")
 
     elif data == "admin_manage_admins":
-        if str(user_id) != str(config.ADMIN_ID):
-            answer_callback(call_id, "Only the Bot Owner can manage admins.", show_alert=True)
-            return
-        
         admins = list(db_admins.find({}))
-        admin_text = f"{config.emoji('key', '🔐')} <b>Admin Management</b>\n\n<b>Owner ID:</b> <code>{config.ADMIN_ID}</code>\n\n<b>Secondary Admins:</b>\n"
+        admin_text = f"🔐 <b>Admin Management</b>\n\n<b>System Admins:</b>\n"
         kb_rows = []
         for a in admins:
             aid = a.get("telegram_id")
             admin_text += f"• <code>{aid}</code>\n"
             kb_rows.append([{"text": f"Remove {aid}", "callback_data": f"admin_remove_admin_{aid}"}])
 
-        kb_rows.append([{"text": f"{config.emoji('add', '➕')} Add Admin", "callback_data": "admin_add_admin_prompt"}])
-        kb_rows.append([{"text": f"{config.emoji('no', '🔙')} Back", "callback_data": "admin_panel"}])
+        kb_rows.append([{"text": "➕ Add Admin", "callback_data": "admin_add_admin_prompt"}])
+        kb_rows.append([{"text": "🔙 Back", "callback_data": "admin_panel"}])
         edit_message(chat_id, message_id, admin_text, reply_markup={"inline_keyboard": kb_rows})
 
     elif data == "admin_add_admin_prompt":
-        if str(user_id) != str(config.ADMIN_ID):
-            return
         USER_STATES[user_id] = "AWAITING_ADD_ADMIN_ID"
         edit_message(chat_id, message_id, "Send the Telegram User ID to make Admin:", reply_markup=get_back_keyboard("admin_manage_admins"))
 
     elif data.startswith("admin_remove_admin_"):
-        if str(user_id) != str(config.ADMIN_ID):
-            return
         aid = int(data.split("_")[3])
         db_admins.delete_one({"telegram_id": aid})
         handle_admin_callback(user_id, chat_id, message_id, "admin_manage_admins")
@@ -982,7 +968,7 @@ def handle_text_message(msg: dict):
     db_u = sync_user(from_user)
 
     if db_u.get("banned", False) and chat_type == "private":
-        send_message(chat_id, f"{config.emoji('no', '🚫')} You are currently banned from using this bot.")
+        send_message(chat_id, "🚫 You are currently banned from using this bot.")
         return
 
     # Handle Group Commands
@@ -990,7 +976,7 @@ def handle_text_message(msg: dict):
         if text.startswith("/duo"):
             parts = text.split()
             if len(parts) < 2:
-                send_message(chat_id, f"{config.emoji('warn', '⚠️')} Usage: <code>/duo UID</code>")
+                send_message(chat_id, "⚠️ Usage: <code>/duo UID</code>")
                 return
             uid = parts[1].strip()
             process_duo_request(user_id, chat_id, uid)
@@ -999,11 +985,10 @@ def handle_text_message(msg: dict):
         return
 
     # --- Private Chat Interactions ---
-    # Global Rate Limiter
     now = time.time()
     last_req = RATE_LIMITS.get(user_id, 0)
     if now - last_req < 2.0:
-        send_message(chat_id, f"{config.emoji('wait', '⏳')} Please wait a moment before sending another request.")
+        send_message(chat_id, "⏳ Please wait a moment before sending another request.")
         return
     RATE_LIMITS[user_id] = now
 
@@ -1014,7 +999,7 @@ def handle_text_message(msg: dict):
         handle_start(from_user, chat_id, args)
         return
     elif text == "/help":
-        send_message(chat_id, f"{config.emoji('target', '🔎')} Use the buttons below or type <code>/duo UID</code> to check duo info.")
+        send_message(chat_id, "🔎 Use the buttons below or type <code>/duo UID</code> to check duo info.")
         return
     elif text == "/id":
         send_message(chat_id, f"🆔 Your Telegram ID: <code>{user_id}</code>")
@@ -1030,7 +1015,7 @@ def handle_text_message(msg: dict):
 
     if state == "AWAITING_UID":
         USER_STATES.pop(user_id, None)
-        loading = send_message(chat_id, f"{config.emoji('wait', '⏳')} Checking Duo information...")
+        loading = send_message(chat_id, "⏳ Checking Duo information...")
         loading_id = loading["message_id"] if loading else None
         process_duo_request(user_id, chat_id, text, loading_id)
         return
@@ -1120,11 +1105,11 @@ def handle_text_message(msg: dict):
 
     # Default Fallback for direct text in private chat
     if text.isdigit():
-        loading = send_message(chat_id, f"{config.emoji('wait', '⏳')} Checking Duo information...")
+        loading = send_message(chat_id, "⏳ Checking Duo information...")
         loading_id = loading["message_id"] if loading else None
         process_duo_request(user_id, chat_id, text, loading_id)
     else:
-        send_message(chat_id, f"{config.emoji('target', '🔎')} Send a numeric UID or choose an option from /start menu.")
+        send_message(chat_id, "🔎 Send a numeric UID or choose an option from /start menu.")
 
 # Special Admin Confirmation Callback Handler
 def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
@@ -1150,13 +1135,12 @@ def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
             success += 1
         else:
             failed += 1
-        time.sleep(0.05)  # Avoid Telegram spam limit
+        time.sleep(0.05)
 
-    send_message(chat_id, f"{config.emoji('ok', '✅')} <b>Broadcast Completed!</b>\n\n✅ Sent: <b>{success}</b>\n❌ Failed: <b>{failed}</b>")
+    send_message(chat_id, f"✅ <b>Broadcast Completed!</b>\n\n✅ Sent: <b>{success}</b>\n❌ Failed: <b>{failed}</b>")
 
 # --- Telegram Polling Engine ---
 def start_polling():
-    # Remove Webhook prior to Polling
     api_call("deleteWebhook", {"drop_pending_updates": True})
     logger.info("Previous Webhooks cleared. Starting Telegram Long Polling Loop...")
 
@@ -1184,10 +1168,8 @@ def start_polling():
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    # 1. Start Flask web server thread for Render Health Endpoint
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"Flask Web Server started on port {config.PORT}")
 
-    # 2. Start Telegram Polling in Main Thread
     start_polling()
