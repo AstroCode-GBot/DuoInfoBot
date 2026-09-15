@@ -8,14 +8,16 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+import certifi
 import pytz
 import requests
 from flask import Flask, jsonify
 from pymongo import ASCENDING, DESCENDING, MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import OperationFailure, PyMongoError, ServerSelectionTimeoutError
 
 import config
 
@@ -47,21 +49,77 @@ def health_check():
 def run_flask():
     app.run(host="0.0.0.0", port=config.PORT)
 
-# --- Database Setup (MongoDB Atlas) ---
-try:
-    mongo_client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
-    db = mongo_client[config.MONGO_DB_NAME]
-    
-    # Setup Collections
-    db_users = db["users"]
-    db_requests = db["requests"]
-    db_referrals = db["referrals"]
-    db_settings = db["settings"]
-    db_admins = db["admins"]
-    db_groups = db["groups"]
-    db_transactions = db["transactions"]
+# --- Database Setup (MongoDB Atlas with SSL & URL-Encode Fix) ---
+def connect_mongodb():
+    raw_uri = config.MONGO_URI
+    if not raw_uri:
+        logger.critical("MONGO_URI is missing in configuration!")
+        sys.exit(1)
 
-    # Setup Indexes
+    # Auto-encode Username and Password if they contain special characters (@, #, $, %, etc.)
+    try:
+        if "://" in raw_uri and "@" in raw_uri:
+            scheme, rest = raw_uri.split("://", 1)
+            auth_and_host = rest.rsplit("@", 1)
+            if len(auth_and_host) == 2 and ":" in auth_and_host[0]:
+                user_pass, host_and_options = auth_and_host
+                username, password = user_pass.split(":", 1)
+                
+                # Unquote first to prevent double encoding, then quote
+                decoded_user = urllib.parse.unquote(username)
+                decoded_pass = urllib.parse.unquote(password)
+                
+                encoded_user = urllib.parse.quote_plus(decoded_user)
+                encoded_pass = urllib.parse.quote_plus(decoded_pass)
+                
+                raw_uri = f"{scheme}://{encoded_user}:{encoded_pass}@{host_and_options}"
+    except Exception as parse_error:
+        logger.warning(f"URI Parsing skipped/failed: {parse_error}")
+
+    try:
+        client = MongoClient(
+            raw_uri,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=10000
+        )
+        # Verify Auth & Connection
+        client.admin.command('ping')
+        logger.info("Successfully connected and authenticated to MongoDB Atlas!")
+        return client
+    except OperationFailure as auth_err:
+        logger.critical(
+            f"MongoDB Authentication Failed ('bad auth'):\n"
+            f"--> Check Username/Password in MongoDB Atlas > Database Access.\n"
+            f"--> Full Error: {auth_err}"
+        )
+        sys.exit(1)
+    except ServerSelectionTimeoutError as timeout_err:
+        logger.critical(
+            f"MongoDB Connection Timeout:\n"
+            f"--> Make sure IP 0.0.0.0/0 is whitelisted in MongoDB Atlas > Network Access.\n"
+            f"--> Full Error: {timeout_err}"
+        )
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"Failed to connect to MongoDB Atlas: {e}")
+        sys.exit(1)
+
+mongo_client = connect_mongodb()
+db = mongo_client[config.MONGO_DB_NAME]
+
+# Setup Collections
+db_users = db["users"]
+db_requests = db["requests"]
+db_referrals = db["referrals"]
+db_settings = db["settings"]
+db_admins = db["admins"]
+db_groups = db["groups"]
+db_transactions = db["transactions"]
+
+# Setup Indexes
+try:
     db_users.create_index([("telegram_id", ASCENDING)], unique=True)
     db_requests.create_index([("user_id", ASCENDING)])
     db_requests.create_index([("uid", ASCENDING)])
@@ -80,11 +138,9 @@ try:
             "force_sub_channel": config.FORCE_SUB_CHANNEL,
             "support_url": config.SUPPORT_URL
         })
-
-    logger.info("Successfully connected to MongoDB Atlas and verified indexes.")
-except Exception as e:
-    logger.critical(f"Failed to connect to MongoDB Atlas: {e}")
-    sys.exit(1)
+    logger.info("Database indexes and default configurations verified.")
+except Exception as idx_err:
+    logger.error(f"Error setting up indexes: {idx_err}")
 
 # --- Dynamic Settings Helper ---
 def get_db_settings() -> dict:
@@ -276,7 +332,6 @@ def log_to_group(text: str):
 
 # --- Core Business Logic: Duo API ---
 def fetch_duo_info(uid: str) -> Tuple[bool, Optional[dict], str]:
-    # Check cache (30s TTL)
     now = time.time()
     if uid in API_CACHE:
         cache_time, cache_data = API_CACHE[uid]
@@ -302,7 +357,6 @@ def fetch_duo_info(uid: str) -> Tuple[bool, Optional[dict], str]:
 
 # --- Duo Processing Core Handler ---
 def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Optional[int] = None):
-    # Validate UID
     if not uid.isdigit() or len(uid) < 5 or len(uid) > 15:
         msg = f"{config.emoji('warn', '⚠️')} <b>Invalid UID.</b>\nPlease send a valid numeric UID."
         if loading_msg_id:
@@ -349,7 +403,6 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     success, data, err_desc = fetch_duo_info(uid)
 
     if not success:
-        # Save failed request log
         db_requests.insert_one({
             "user_id": user_id,
             "uid": uid,
@@ -371,7 +424,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
             send_message(chat_id, msg)
         return
 
-    # Success: Deduct payment now
+    # Success: Deduct payment
     cost_text = "Free"
     if is_free:
         db_users.update_one(
@@ -503,7 +556,6 @@ def handle_callback(callback: dict):
         answer_callback(call_id, "You are banned from using this bot.", show_alert=True)
         return
 
-    # --- Force Sub Check Callback ---
     if data == "check_sub":
         if check_force_sub(user_id):
             answer_callback(call_id, "Thank you for joining!")
@@ -514,7 +566,6 @@ def handle_callback(callback: dict):
             answer_callback(call_id, "You have not joined the channel yet!", show_alert=True)
         return
 
-    # Check force sub for general navigation
     if not check_force_sub(user_id):
         answer_callback(call_id, "Please join our channel first!", show_alert=True)
         send_message(chat_id, f"{config.emoji('warn', '⚠️')} <b>Please join our official channel to use this bot.</b>", reply_markup=get_force_sub_keyboard())
@@ -522,11 +573,9 @@ def handle_callback(callback: dict):
 
     answer_callback(call_id)
 
-    # Clean State
     if user_id in USER_STATES and not data.startswith("admin_"):
         USER_STATES.pop(user_id, None)
 
-    # --- Menu Navigation ---
     if data == "main_menu":
         welcome_text = (
             f"{config.emoji('hi', '👋')} <b>Welcome to Duo Info Bot</b>\n\n"
@@ -697,7 +746,6 @@ def handle_callback(callback: dict):
         }
         edit_message(chat_id, message_id, sup_text, reply_markup=kb)
 
-    # --- ADMIN PANEL CALLS ---
     elif data.startswith("admin_"):
         if not is_admin(user_id):
             answer_callback(call_id, "❌ Not authorized.", show_alert=True)
@@ -734,9 +782,6 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         }
         edit_message(chat_id, message_id, admin_text, reply_markup=kb)
 
-    elif data == "admin_confirm_broadcast":
-        handle_admin_broadcast_confirm(user_id, chat_id)
-
     elif data == "admin_stats":
         tot_users = db_users.count_documents({})
         active_users = db_users.count_documents({"banned": False})
@@ -746,7 +791,6 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         succ_reqs = db_requests.count_documents({"status": "success"})
         fail_reqs = db_requests.count_documents({"status": "failed"})
 
-        # Aggregations
         pipeline_earned = [{"$match": {"type": {"$in": ["referral", "admin_add"]}}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
         pipeline_spent = [{"$match": {"type": "spend"}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
 
@@ -981,7 +1025,6 @@ def handle_text_message(msg: dict):
             upsert=True
         )
 
-    # Sync user record
     db_u = sync_user(from_user)
 
     if db_u.get("banned", False) and chat_type == "private":
@@ -1002,7 +1045,6 @@ def handle_text_message(msg: dict):
         return
 
     # --- Private Chat Interactions ---
-    # Global Rate Limiter
     now = time.time()
     last_req = RATE_LIMITS.get(user_id, 0)
     if now - last_req < 2.0:
@@ -1010,7 +1052,6 @@ def handle_text_message(msg: dict):
         return
     RATE_LIMITS[user_id] = now
 
-    # Handle Command Shortcuts
     if text.startswith("/start"):
         parts = text.split()
         args = parts[1] if len(parts) > 1 else ""
@@ -1028,7 +1069,6 @@ def handle_text_message(msg: dict):
             handle_admin_callback(user_id, chat_id, m["message_id"], "admin_panel")
         return
 
-    # Handle Interactive FSM States
     state = USER_STATES.get(user_id)
 
     if state == "AWAITING_UID":
@@ -1153,13 +1193,12 @@ def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
             success += 1
         else:
             failed += 1
-        time.sleep(0.05)  # Avoid Telegram spam limit
+        time.sleep(0.05)
 
     send_message(chat_id, f"{config.emoji('ok', '✅')} <b>Broadcast Completed!</b>\n\n✅ Sent: <b>{success}</b>\n❌ Failed: <b>{failed}</b>")
 
 # --- Telegram Polling Engine ---
 def start_polling():
-    # Remove Webhook prior to Polling
     api_call("deleteWebhook", {"drop_pending_updates": True})
     logger.info("Previous Webhooks cleared. Starting Telegram Long Polling Loop...")
 
@@ -1187,10 +1226,8 @@ def start_polling():
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    # 1. Start Flask web server thread for Render Health Endpoint
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"Flask Web Server started on port {config.PORT}")
 
-    # 2. Start Telegram Polling in Main Thread
     start_polling()
