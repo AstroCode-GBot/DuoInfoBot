@@ -39,24 +39,115 @@ def esc(text: Any) -> str:
         return ""
     return html.escape(str(text))
 
-def api_call(method: str, payload: dict = None, files: dict = None) -> Optional[dict]:
+class TelegramConflictError(RuntimeError):
+    """Raised when another process is already polling the same bot token."""
+    pass
+
+
+def api_call(
+    method: str,
+    payload: dict = None,
+    files: dict = None,
+    *,
+    raise_on_conflict: bool = False,
+    max_retries: int = 3
+) -> Optional[dict]:
     url = f"{BASE_URL}/{method}"
-    try:
-        response = session.post(url, data=payload, files=files, timeout=20)
-        if response.status_code == 429:
-            retry_after = response.json().get("parameters", {}).get("retry_after", 3)
-            logger.warning(f"Telegram Rate Limit (429). Sleeping for {retry_after}s...")
-            time.sleep(retry_after)
-            return api_call(method, payload, files)
-        
-        res_json = response.json()
-        if not res_json.get("ok"):
-            logger.error(f"Telegram API Error [{method}]: {res_json.get('description')}")
+    http_timeout = 45 if method == "getUpdates" else (
+        35 if method in {"getFile", "getChatMember"} else 25
+    )
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.post(
+                url,
+                data=payload,
+                files=files,
+                timeout=http_timeout
+            )
+
+            if response.status_code == 429:
+                try:
+                    retry_after = int(
+                        response.json().get("parameters", {}).get("retry_after", 3)
+                    )
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    retry_after = 3
+
+                if attempt >= max_retries:
+                    logger.error(f"Telegram Rate Limit (429) exhausted for {method}.")
+                    return None
+
+                retry_after = max(1, min(retry_after, 60))
+                logger.warning(
+                    f"Telegram Rate Limit (429) on {method}. "
+                    f"Sleeping for {retry_after}s..."
+                )
+                time.sleep(retry_after)
+                continue
+
+            if response.status_code == 409:
+                try:
+                    description = response.json().get(
+                        "description",
+                        "Conflict: another getUpdates request is active."
+                    )
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    description = "Conflict: another getUpdates request is active."
+
+                if method == "getUpdates" and raise_on_conflict:
+                    raise TelegramConflictError(description)
+
+                logger.error(f"Telegram API Conflict [{method}]: {description}")
+                return None
+
+            try:
+                res_json = response.json()
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                logger.error(
+                    f"Invalid JSON response from Telegram [{method}] "
+                    f"(HTTP {response.status_code}): {exc}"
+                )
+                return None
+
+            if not res_json.get("ok"):
+                logger.error(
+                    f"Telegram API Error [{method}]: {res_json.get('description')}"
+                )
+                return None
+
+            return res_json.get("result")
+
+        except requests.exceptions.ReadTimeout:
+            if method == "getUpdates":
+                # Normal long polling can end on timeout when there are no updates.
+                return []
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            logger.error(f"HTTP Timeout calling Telegram API [{method}]")
             return None
-        return res_json.get("result")
-    except Exception as e:
-        logger.error(f"HTTP Error calling Telegram API [{method}]: {e}")
-        return None
+
+        except requests.exceptions.RequestException as exc:
+            if attempt < max_retries:
+                logger.warning(
+                    f"Telegram HTTP error [{method}] "
+                    f"attempt {attempt + 1}/{max_retries + 1}: {exc}"
+                )
+                time.sleep(min(2 ** attempt, 5))
+                continue
+            logger.error(f"HTTP Error calling Telegram API [{method}]: {exc}")
+            return None
+
+        except TelegramConflictError:
+            raise
+
+        except Exception as exc:
+            logger.exception(f"Unexpected error calling Telegram API [{method}]: {exc}")
+            return None
+
+    return None
+
 
 def send_message(chat_id: int, text: str, reply_markup: dict = None, parse_mode: str = "HTML") -> Optional[dict]:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
@@ -85,50 +176,105 @@ def send_document(chat_id: int, file_data: bytes, filename: str, caption: str = 
     return api_call("sendDocument", payload, files=files)
 
 # --- TELEGRAM-BASED DATABASE SYSTEM ---
-DB_DATA: Dict[str, Any] = {
-    "users": {},
-    "requests": [],
-    "referrals": [],
-    "settings": {
-        "request_cost": config.REQUEST_COST,
-        "daily_free_requests": config.DAILY_FREE_REQUESTS,
-        "referral_reward": config.REFERRAL_REWARD,
-        "force_sub_channel": config.FORCE_SUB_CHANNEL,
-        "support_url": config.SUPPORT_URL
-    },
-    "admins": [],
-    "groups": {},
-    "transactions": []
-}
+def default_db() -> Dict[str, Any]:
+    return {
+        "users": {},
+        "requests": [],
+        "referrals": [],
+        "settings": {
+            "request_cost": config.REQUEST_COST,
+            "daily_free_requests": config.DAILY_FREE_REQUESTS,
+            "referral_reward": config.REFERRAL_REWARD,
+            "force_sub_channel": config.FORCE_SUB_CHANNEL,
+            "support_url": config.SUPPORT_URL
+        },
+        "admins": [],
+        "groups": {},
+        "transactions": []
+    }
 
+
+DB_DATA: Dict[str, Any] = default_db()
 LAST_SAVE_TIME = 0
+
+
+def normalize_db(raw: Any) -> Dict[str, Any]:
+    """Keep older Telegram backups compatible with the current DB schema."""
+    base = default_db()
+    if not isinstance(raw, dict):
+        return base
+
+    for key in ("users", "requests", "referrals", "admins", "groups", "transactions"):
+        value = raw.get(key)
+        expected_type = list if key in {
+            "requests", "referrals", "admins", "transactions"
+        } else dict
+        if isinstance(value, expected_type):
+            base[key] = value
+
+    raw_settings = raw.get("settings")
+    if isinstance(raw_settings, dict):
+        for key in base["settings"]:
+            if key in raw_settings:
+                base["settings"][key] = raw_settings[key]
+
+    return base
+
 
 def load_db_from_telegram():
     global DB_DATA
+
     if not config.LOG_GROUP_ID:
-        logger.warning("LOG_GROUP_ID not configured! Telegram Database Persistence disabled.")
+        logger.warning(
+            "LOG_GROUP_ID not configured! Telegram Database Persistence disabled."
+        )
         return
 
     logger.info("Fetching latest Database Backup from Telegram Channel/Group...")
-    try:
-        # Step 1: Find the latest document in LOG_GROUP_ID using getUpdates or pinned/history if available
-        # Note: We fetch channel/chat history via sending a search or checking channel pinning
-        res = api_call("getChat", {"chat_id": config.LOG_GROUP_ID})
-        if res and "pinned_message" in res and "document" in res["pinned_message"]:
-            doc = res["pinned_message"]["document"]
-            file_id = doc["file_id"]
-            file_info = api_call("getFile", {"file_id": file_id})
-            if file_info and "file_path" in file_info:
-                file_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_info['file_path']}"
-                dl_res = requests.get(file_url, timeout=30)
-                if dl_res.status_code == 200:
-                    DB_DATA = json.loads(dl_res.text)
-                    logger.info("Successfully loaded database backup from Telegram pinned message!")
-                    return
-    except Exception as e:
-        logger.error(f"Failed to restore DB from Telegram: {e}")
 
-    logger.info("Starting with default fresh In-Memory DB.")
+    try:
+        res = api_call("getChat", {"chat_id": config.LOG_GROUP_ID})
+
+        if not res:
+            logger.warning(
+                "Could not access LOG_GROUP_ID. Make sure the bot is a member/admin "
+                "of the configured group/channel and the chat ID is correct."
+            )
+            return
+
+        pinned = res.get("pinned_message") or {}
+        doc = pinned.get("document") or {}
+        file_id = doc.get("file_id")
+
+        if not file_id:
+            logger.info(
+                "No pinned database_backup.json document found. "
+                "Starting with the current/default DB."
+            )
+            return
+
+        file_info = api_call("getFile", {"file_id": file_id})
+        file_path = file_info.get("file_path") if file_info else None
+        if not file_path:
+            logger.warning("Telegram returned no file_path for the pinned DB backup.")
+            return
+
+        file_url = (
+            f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_path}"
+        )
+        dl_res = requests.get(file_url, timeout=35)
+        dl_res.raise_for_status()
+
+        restored = json.loads(dl_res.text)
+        DB_DATA = normalize_db(restored)
+        logger.info("Successfully loaded database backup from Telegram pinned message!")
+
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Failed to download DB backup from Telegram: {exc}")
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.error(f"Invalid DB backup JSON: {exc}")
+    except Exception as exc:
+        logger.exception(f"Failed to restore DB from Telegram: {exc}")
 
 def save_db_to_telegram(force=False):
     global LAST_SAVE_TIME
@@ -177,7 +323,7 @@ def health_check():
     return "Duo Bot is running", 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=config.PORT)
+    app.run(host="0.0.0.0", port=config.PORT, threaded=True, use_reloader=False)
 
 # --- Dynamic Settings Helper ---
 def get_db_settings() -> dict:
@@ -192,8 +338,7 @@ def get_db_settings() -> dict:
 # --- Date/Time Helpers ---
 def get_local_now() -> datetime:
     import pytz
-    tz = pytz.timezone(config.TIMEZONE)
-    return datetime.now(tz)
+    return datetime.now(config.TIMEZONE)
 
 def get_today_str() -> str:
     return get_local_now().strftime("%Y-%m-%d")
@@ -270,8 +415,8 @@ def get_force_sub_keyboard() -> dict:
 
     return {
         "inline_keyboard": [
-            [{"text": f"{config.emoji('join', '📢')} Join Channel", "url": url, "icon_custom_emoji_id": config.PEM["join"], "style": "primary"}],
-            [{"text": f"{config.emoji('check', '✅')} I've Joined", "callback_data": "check_sub", "icon_custom_emoji_id": config.PEM["check"], "style": "success"}]
+            [{"text": f"{config.emoji('join', '📢')} Join Channel", "url": url, "style": "primary"}],
+            [{"text": f"{config.emoji('check', '✅')} I've Joined", "callback_data": "check_sub", "style": "success"}]
         ]
     }
 
@@ -279,20 +424,20 @@ def get_force_sub_keyboard() -> dict:
 def get_main_keyboard(user_id: int) -> dict:
     rows = [
         [
-            {"text": f"{config.emoji('target', '🔎')} Check Duo", "callback_data": "check_duo", "icon_custom_emoji_id": config.PEM["target"], "style": "primary"},
-            {"text": f"{config.emoji('money', '💰')} Coins", "callback_data": "coins", "icon_custom_emoji_id": config.PEM["money"]}
+            {"text": f"{config.emoji('target', '🔎')} Check Duo", "callback_data": "check_duo", "style": "primary"},
+            {"text": f"{config.emoji('money', '💰')} Coins", "callback_data": "coins"}
         ],
         [
-            {"text": f"{config.emoji('gift', '🎁')} Referral", "callback_data": "referral", "icon_custom_emoji_id": config.PEM["gift"]},
-            {"text": f"{config.emoji('user', '👤')} Profile", "callback_data": "profile", "icon_custom_emoji_id": config.PEM["user"]}
+            {"text": f"{config.emoji('gift', '🎁')} Referral", "callback_data": "referral"},
+            {"text": f"{config.emoji('user', '👤')} Profile", "callback_data": "profile"}
         ],
         [
-            {"text": f"{config.emoji('view', '📊')} History", "callback_data": "history_0", "icon_custom_emoji_id": config.PEM["view"]},
-            {"text": f"{config.emoji('msg', '💬')} Support", "callback_data": "support", "icon_custom_emoji_id": config.PEM["msg"]}
+            {"text": f"{config.emoji('view', '📊')} History", "callback_data": "history_0"},
+            {"text": f"{config.emoji('msg', '💬')} Support", "callback_data": "support"}
         ]
     ]
     if is_admin(user_id):
-        rows.append([{"text": f"{config.emoji('crown', '👑')} Admin Panel", "callback_data": "admin_panel", "icon_custom_emoji_id": config.PEM["crown"], "style": "primary"}])
+        rows.append([{"text": f"{config.emoji('crown', '👑')} Admin Panel", "callback_data": "admin_panel", "style": "primary"}])
     return {"inline_keyboard": rows}
 
 def get_back_keyboard(target: str = "main_menu") -> dict:
@@ -579,7 +724,7 @@ def handle_callback(callback: dict):
 
     elif data == "profile":
         t_id = db_u.get("telegram_id")
-        u_name = f"@{db_u.get('username')}" if db_u.get("username") else "None"
+        u_name = f"@{esc(db_u.get('username'))}" if db_u.get("username") else "None"
         coins = db_u.get("coins", 0)
         refs = db_u.get("referral_count", 0)
         tot_req = db_u.get("total_requests", 0)
@@ -737,10 +882,10 @@ def handle_callback(callback: dict):
         if not is_admin(user_id):
             answer_callback(call_id, "❌ Not authorized.", show_alert=True)
             return
-        handle_admin_callback(user_id, chat_id, message_id, data)
+        handle_admin_callback(user_id, chat_id, message_id, data, call_id)
 
 # --- Admin Panel Callback Handler ---
-def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str):
+def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str, call_id: Optional[str] = None):
     if data == "admin_panel":
         admin_text = f"{config.emoji('crown', '👑')} <b>Admin Panel</b>\n\nSelect an administrative option:"
         kb = {
@@ -965,7 +1110,6 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
 
     elif data == "admin_manage_admins":
         if str(user_id) != str(config.ADMIN_ID):
-            answer_callback(call_id, "Only the Bot Owner can manage admins.", show_alert=True)
             return
         
         admins = DB_DATA.get("admins", [])
@@ -1158,7 +1302,7 @@ def handle_text_message(msg: dict):
                     ]
                 ]
             }
-            send_message(chat_id, f"<b>Broadcast Preview:</b>\n\n{text}\n\nAre you sure you want to send this to all users?", reply_markup=kb)
+            send_message(chat_id, f"<b>Broadcast Preview:</b>\n\n{esc(text)}\n\nAre you sure you want to send this to all users?", reply_markup=kb)
         return
 
     # Default Fallback for direct text in private chat
@@ -1171,6 +1315,10 @@ def handle_text_message(msg: dict):
 
 # Special Admin Confirmation Callback Handler
 def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
+    if not is_admin(user_id):
+        send_message(chat_id, "❌ Not authorized.")
+        return
+
     data_dict = STATE_DATA.get(user_id, {})
     b_text = data_dict.get("broadcast_text")
     if not b_text:
@@ -1188,7 +1336,7 @@ def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
 
     for u in users:
         target_id = u["telegram_id"]
-        res = send_message(target_id, b_text)
+        res = send_message(target_id, esc(b_text))
         if res:
             success += 1
         else:
@@ -1199,30 +1347,84 @@ def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
 
 # --- Telegram Polling Engine ---
 def start_polling():
-    api_call("deleteWebhook", {"drop_pending_updates": True})
+    # Webhook and getUpdates cannot be used together.
+    webhook_result = api_call("deleteWebhook", {"drop_pending_updates": True})
+    if webhook_result is None:
+        logger.warning(
+            "deleteWebhook did not complete successfully. Polling will still be attempted."
+        )
+
     logger.info("Previous Webhooks cleared. Starting Telegram Long Polling Loop...")
 
     offset = 0
+    conflict_logged = False
+
     while True:
         try:
-            updates = api_call("getUpdates", {"offset": offset, "timeout": 20})
-            if updates and isinstance(updates, list):
-                for update in updates:
-                    offset = update["update_id"] + 1
+            updates = api_call(
+                "getUpdates",
+                {"offset": offset, "timeout": 25},
+                raise_on_conflict=True
+            )
+
+            if updates is None:
+                time.sleep(2)
+                continue
+
+            if not isinstance(updates, list):
+                time.sleep(1)
+                continue
+
+            conflict_logged = False
+
+            for update in updates:
+                try:
+                    update_id = update.get("update_id")
+                    if isinstance(update_id, int):
+                        offset = update_id + 1
 
                     if "message" in update:
                         handle_text_message(update["message"])
+
                     elif "callback_query" in update:
                         cb = update["callback_query"]
                         if cb.get("data") == "admin_confirm_broadcast":
                             answer_callback(cb["id"])
-                            handle_admin_broadcast_confirm(cb["from"]["id"], cb["message"]["chat"]["id"])
+                            handle_admin_broadcast_confirm(
+                                cb["from"]["id"],
+                                cb.get("message", {}).get(
+                                    "chat", {}
+                                ).get("id", cb["from"]["id"])
+                            )
                         else:
                             handle_callback(cb)
 
-        except Exception as e:
-            logger.error(f"Error in Long Polling Loop: {e}")
+                except Exception as exc:
+                    logger.exception(f"Error processing Telegram update: {exc}")
+
+        except TelegramConflictError as exc:
+            if not conflict_logged:
+                logger.error(
+                    "Telegram 409 Conflict: another process/service is already "
+                    "calling getUpdates with this BOT_TOKEN. Stop every other "
+                    "running instance (Render duplicate service, local PC/Termux/"
+                    "Replit/VPS, etc.) and keep only this polling instance."
+                )
+                logger.error(f"Telegram says: {exc}")
+                conflict_logged = True
+
+            # Telegram does not provide an API method to forcibly terminate
+            # another long-polling client.
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            logger.info("Polling stopped by KeyboardInterrupt.")
+            break
+
+        except Exception as exc:
+            logger.exception(f"Error in Long Polling Loop: {exc}")
             time.sleep(3)
+
 
 # --- Entry Point ---
 if __name__ == "__main__":
