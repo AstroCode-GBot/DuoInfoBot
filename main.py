@@ -200,6 +200,7 @@ def api_call(
 
         except requests.exceptions.ReadTimeout:
             if method == "getUpdates":
+                # Normal long polling can end on timeout when there are no updates.
                 return []
             if attempt < max_retries:
                 time.sleep(1)
@@ -358,6 +359,7 @@ def load_db_from_telegram():
 def save_db_to_telegram(force=False):
     global LAST_SAVE_TIME
     now = time.time()
+    # Save maximum once every 5 seconds to prevent spamming Telegram limits unless forced
     if not force and (now - LAST_SAVE_TIME < 5):
         return
 
@@ -373,6 +375,7 @@ def save_db_to_telegram(force=False):
             "database_backup.json", 
             caption=f"📦 <b>Automated DB Backup</b>\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        # Pin the latest DB backup so it can be restored on reboot
         if res and "message_id" in res:
             api_call("pinChatMessage", {
                 "chat_id": config.LOG_GROUP_ID,
@@ -446,7 +449,6 @@ def sync_user(user: dict) -> dict:
             "referral_count": 0,
             "referral_earnings": 0,
             "banned": False,
-            "phone_number": None,
             "joined_at": get_local_now().strftime("%Y-%m-%d %H:%M:%S")
         }
         users[user_id] = new_user
@@ -455,11 +457,13 @@ def sync_user(user: dict) -> dict:
 
     existing = users[user_id]
 
+    # Reset daily free requests if new date
     if existing.get("daily_free_date") != today:
         existing["daily_free_date"] = today
         existing["daily_free_used"] = 0
         save_db_to_telegram()
 
+    # Sync username/first_name changes
     if existing.get("username") != user.get("username", "") or existing.get("first_name") != user.get("first_name", ""):
         existing["username"] = user.get("username", "")
         existing["first_name"] = user.get("first_name", "")
@@ -491,36 +495,16 @@ def get_force_sub_keyboard() -> dict:
 
     return {
         "inline_keyboard": [
-            [{"text": f"{config.emoji('join', '📢')} Join Channel", "url": url}],
-            [{"text": f"{config.emoji('check', '✅')} I Have Joined", "callback_data": "check_sub"}]
+            [{"text": f"{config.emoji('join', '📢')} Join Channel", "url": url, "style": "primary"}],
+            [{"text": f"{config.emoji('check', '✅')} I've Joined", "callback_data": "check_sub", "style": "success"}]
         ]
-    }
-
-# --- Reply Keyboard (Bot UI Bottom Buttons) ---
-def get_bottom_reply_keyboard() -> dict:
-    return {
-        "keyboard": [
-            [
-                {
-                    "text": "SHARE NUMBER",
-                    "request_contact": True
-                }
-            ],
-            [
-                {
-                    "text": "🛡️ চুক্তিপত্র / Policy"
-                }
-            ]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False
     }
 
 # --- Button UI Builder ---
 def get_main_keyboard(user_id: int) -> dict:
     rows = [
         [
-            {"text": f"{config.emoji('target', '🔎')} Check Duo", "callback_data": "check_duo"},
+            {"text": f"{config.emoji('target', '🔎')} Check Duo", "callback_data": "check_duo", "style": "primary"},
             {"text": f"{config.emoji('money', '💰')} Coins", "callback_data": "coins"}
         ],
         [
@@ -533,7 +517,7 @@ def get_main_keyboard(user_id: int) -> dict:
         ]
     ]
     if is_admin(user_id):
-        rows.append([{"text": f"{config.emoji('crown', '👑')} Admin Panel", "callback_data": "admin_panel"}])
+        rows.append([{"text": f"{config.emoji('crown', '👑')} Admin Panel", "callback_data": "admin_panel", "style": "primary"}])
     return {"inline_keyboard": rows}
 
 def get_back_keyboard(target: str = "main_menu") -> dict:
@@ -551,79 +535,27 @@ def log_to_group(text: str):
 # --- Core Business Logic: Duo API ---
 def fetch_duo_info(uid: str) -> Tuple[bool, Optional[dict], str]:
     now = time.time()
-    cached = API_CACHE.get(uid)
-    if cached:
-        cache_time, cache_data = cached
+    if uid in API_CACHE:
+        cache_time, cache_data = API_CACHE[uid]
         if now - cache_time < 30:
             return True, cache_data, "cache"
 
-    url = str(config.DUO_API_URL).strip()
-    if not url:
-        return False, None, "Duo API URL is not configured."
-
     try:
-        resp = requests.get(
-            url,
-            params={"uid": str(uid)},
-            headers={"Accept": "application/json", "User-Agent": "DuoInfoBot/2.0"},
-            timeout=(10, 30),
-        )
-
-        logger.info("Duo API: %s?uid=%s -> HTTP %s", url, uid, resp.status_code)
-
-        if not (200 <= resp.status_code < 300):
-            body = (resp.text or "").strip().replace("\n", " ")[:300]
-            logger.error("Duo API HTTP error %s: %s", resp.status_code, body)
-            return False, None, f"Duo API returned HTTP {resp.status_code}."
-
-        if not resp.text or not resp.text.strip():
-            return False, None, "Duo API returned an empty response."
-
-        try:
-            data = resp.json()
-        except ValueError:
-            body = resp.text.strip()[:300]
-            logger.error("Duo API returned non-JSON response: %s", body)
-            return False, None, "Duo API returned invalid JSON."
-
-        if isinstance(data, dict):
-            for key in ("data", "result", "response"):
-                nested = data.get(key)
-                if isinstance(nested, dict) and (
-                    "PlayerName" in nested or "PlayerUID" in nested or "DuoPartnerName" in nested
-                ):
-                    data = nested
-                    break
-        else:
-            logger.error("Duo API JSON type was %s, expected object", type(data).__name__)
-            return False, None, "Duo API returned an unexpected response format."
-
-        if not data:
+        resp = requests.get(config.DUO_API_URL, params={"uid": uid}, timeout=15)
+        if resp.status_code != 200:
+            return False, None, "API returns error or is offline."
+        
+        data = resp.json()
+        if not data or "PlayerName" not in data or not data.get("PlayerName"):
             return False, None, "No Duo information found for this UID."
-
-        known_keys = {"PlayerName", "PlayerUID", "DuoPartnerName"}
-        if not any(k in data for k in known_keys):
-            logger.error("Unexpected Duo API JSON keys: %s", list(data.keys())[:30])
-            return False, None, "Duo API returned an unexpected data format."
 
         API_CACHE[uid] = (now, data)
         return True, data, "live"
-
-    except requests.exceptions.ConnectTimeout:
-        logger.error("Duo API connect timeout: %s", url)
-        return False, None, "Could not connect to Duo API."
-    except requests.exceptions.ReadTimeout:
-        logger.error("Duo API read timeout: %s", url)
-        return False, None, "Duo API took too long to respond."
-    except requests.exceptions.ConnectionError as e:
-        logger.error("Duo API connection error: %s", e)
-        return False, None, "Could not connect to Duo API."
-    except requests.exceptions.RequestException as e:
-        logger.error("Duo API request error: %s", e)
-        return False, None, "Duo API request failed."
+    except requests.exceptions.Timeout:
+        return False, None, "Duo API request timed out."
     except Exception as e:
-        logger.exception("Unexpected Duo API error: %s", e)
-        return False, None, "Unexpected Duo API error."
+        logger.error(f"Duo API Request Exception: {e}")
+        return False, None, "Failed to connect to Duo API."
 
 # --- Duo Processing Core Handler ---
 def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Optional[int] = None):
@@ -696,7 +628,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
             send_message(chat_id, msg)
         return
 
-    # Success
+    # Success: Deduct payment
     cost_text = "Free"
     if is_free:
         db_u["daily_free_used"] = db_u.get("daily_free_used", 0) + 1
@@ -728,6 +660,7 @@ def process_duo_request(user_id: int, chat_id: int, uid: str, loading_msg_id: Op
     })
     save_db_to_telegram()
 
+    # Format Output Result
     p_name = esc(data.get("PlayerName", "N/A"))
     p_uid = esc(data.get("PlayerUID", uid))
     d_name = esc(data.get("DuoPartnerName", "None"))
@@ -766,6 +699,7 @@ def handle_start(user: dict, chat_id: int, args: str = ""):
     db_u = sync_user(user)
     user_id = user["id"]
 
+    # Check Referral Parameter
     if args.startswith("ref_") and db_u.get("referrer_id") is None:
         try:
             ref_id = int(args.replace("ref_", "").strip())
@@ -803,16 +737,6 @@ def handle_start(user: dict, chat_id: int, args: str = ""):
         send_message(chat_id, f"{config.emoji('warn', '⚠️')} <b>Please join our official channel to use this bot.</b>", reply_markup=get_force_sub_keyboard())
         return
 
-    # First, send bottom Reply Keyboard (Share Number & Policy)
-    send_message(
-        chat_id,
-        f"🔊 <b>স্বাগতম, {esc(user.get('first_name'))}!</b>\n\n"
-        f"<b>Duo Info Bot</b> ব্যবহার শুরু করতে দয়া করে নিচের বাটনে চেপে আপনার ফোন নম্বর শেয়ার করুন।\n\n"
-        f"⚠️ <b>আপনার নম্বর শুধুমাত্র অ্যাকাউন্ট ভেরিফিকেশনের জন্য ব্যবহার করা হবে — অন্য কোনো কাজে নয়।</b>",
-        reply_markup=get_bottom_reply_keyboard()
-    )
-
-    # Then send main inline menu
     welcome_text = (
         f"{config.emoji('hi', '👋')} <b>Welcome to Duo Info Bot</b>\n\n"
         f"{config.emoji('target', '🔎')} Check Duo information instantly\n"
@@ -885,7 +809,6 @@ def handle_callback(callback: dict):
         refs = db_u.get("referral_count", 0)
         tot_req = db_u.get("total_requests", 0)
         joined = db_u.get("joined_at", "N/A")
-        phone = db_u.get("phone_number", "Not Shared")
 
         settings = get_db_settings()
         daily_limit = settings.get("daily_free_requests", 1)
@@ -896,7 +819,6 @@ def handle_callback(callback: dict):
             f"{config.emoji('user', '👤')} <b>Your Profile</b>\n\n"
             f"🆔 Telegram ID: <code>{t_id}</code>\n"
             f"👤 Username: {u_name}\n"
-            f"📱 Phone: <code>{phone}</code>\n"
             f"{config.emoji('money', '💰')} Coins Balance: <b>{coins}</b>\n"
             f"{config.emoji('gift', '🎁')} Referrals: <b>{refs}</b>\n"
             f"{config.emoji('target', '🔎')} Total Requests: <b>{tot_req}</b>\n"
@@ -955,7 +877,7 @@ def handle_callback(callback: dict):
         skip = page * limit
 
         user_reqs = [r for r in DB_DATA["requests"] if r.get("user_id") == user_id]
-        user_reqs.reverse()
+        user_reqs.reverse() # Newest first
         
         total_reqs = len(user_reqs)
         reqs = user_reqs[skip:skip + limit]
@@ -1151,7 +1073,6 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
             f"Name: <b>{esc(u.get('first_name'))}</b>\n"
             f"🆔 Telegram ID: <code>{u.get('telegram_id')}</code>\n"
             f"🔗 Username: @{esc(u.get('username'))}\n"
-            f"📱 Phone: <code>{u.get('phone_number', 'N/A')}</code>\n"
             f"💰 Coins: <b>{u.get('coins', 0)}</b>\n"
             f"🎁 Referrals: <b>{u.get('referral_count', 0)}</b>\n"
             f"🔎 Requests: <b>{u.get('total_requests', 0)}</b>\n"
@@ -1251,9 +1172,9 @@ def handle_admin_callback(user_id: int, chat_id: int, message_id: int, data: str
         edit_message(chat_id, message_id, "Generating Users CSV...")
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["Telegram ID", "Username", "First Name", "Phone Number", "Coins", "Referrals", "Total Requests", "Joined At"])
+        writer.writerow(["Telegram ID", "Username", "First Name", "Coins", "Referrals", "Total Requests", "Joined At"])
         for u in DB_DATA["users"].values():
-            writer.writerow([u.get("telegram_id"), u.get("username"), u.get("first_name"), u.get("phone_number", "N/A"), u.get("coins"), u.get("referral_count"), u.get("total_requests"), u.get("joined_at")])
+            writer.writerow([u.get("telegram_id"), u.get("username"), u.get("first_name"), u.get("coins"), u.get("referral_count"), u.get("total_requests"), u.get("joined_at")])
 
         send_document(chat_id, output.getvalue().encode('utf-8'), "users.csv", caption="Users Export")
 
@@ -1304,6 +1225,7 @@ def handle_text_message(msg: dict):
     chat = msg["chat"]
     chat_id = chat["id"]
     chat_type = chat["type"]
+    text = msg.get("text", "").strip()
 
     # Track Groups
     if chat_type in ["group", "supergroup"]:
@@ -1317,34 +1239,6 @@ def handle_text_message(msg: dict):
 
     if db_u.get("banned", False) and chat_type == "private":
         send_message(chat_id, f"{config.emoji('no', '🚫')} You are currently banned from using this bot.")
-        return
-
-    # Handle Contact Share Event
-    if "contact" in msg:
-        contact_info = msg["contact"]
-        phone_number = contact_info.get("phone_number")
-        
-        db_u["phone_number"] = phone_number
-        save_db_to_telegram()
-
-        send_message(
-            chat_id, 
-            f"✅ <b>ধন্যবাদ!</b> আপনার নম্বর (<code>{phone_number}</code>) সফলভাবে ভেরিফাই করা হয়েছে।"
-        )
-        log_to_group(f"📱 <b>Contact Shared</b>\n\n👤 User: <code>{user_id}</code>\n📞 Phone: <code>{phone_number}</code>")
-        return
-
-    text = msg.get("text", "").strip()
-
-    # Handle Policy Button Text Click
-    if "চুক্তিপত্র" in text or "Policy" in text:
-        policy_text = (
-            "📜 <b>আমাদের নীতি ও চুক্তিপত্র (Terms & Policy)</b>\n\n"
-            "১. আপনার ফোন নম্বর ও অ্যাকাউন্ট তথ্য সম্পূর্ণ সুরক্ষিত রাখা হয়।\n"
-            "২. অনিয়ম বা বটের অপব্যবহার করলে অ্যাকাউন্ট স্থায়ীভাবে ব্যান করা হতে পারে।\n"
-            "৩. বটের মাধ্যমে প্রাপ্ত তথ্যের সঠিক ব্যবহারের দায়ভার ব্যবহারকারীর।"
-        )
-        send_message(chat_id, policy_text)
         return
 
     # Handle Group Commands
@@ -1533,6 +1427,7 @@ def handle_admin_broadcast_confirm(user_id: int, chat_id: int):
 
 # --- Telegram Polling Engine ---
 def start_polling():
+    # Webhook and getUpdates cannot be used together.
     webhook_result = api_call("deleteWebhook", {"drop_pending_updates": True})
     if webhook_result is None:
         logger.warning(
@@ -1592,11 +1487,14 @@ def start_polling():
                 logger.error(
                     "Telegram 409 Conflict: another process/service is already "
                     "calling getUpdates with this BOT_TOKEN. Stop every other "
-                    "running instance."
+                    "running instance (Render duplicate service, local PC/Termux/"
+                    "Replit/VPS, etc.) and keep only this polling instance."
                 )
                 logger.error(f"Telegram says: {exc}")
                 conflict_logged = True
 
+            # Telegram does not provide an API method to forcibly terminate
+            # another long-polling client.
             time.sleep(10)
 
         except KeyboardInterrupt:
