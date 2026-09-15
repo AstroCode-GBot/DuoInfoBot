@@ -12,9 +12,89 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask
 
-import config
+# ============================================================
+# EMBEDDED CONFIGURATION
+# No separate config.py is required. All values come from
+# Render Environment Variables.
+# ============================================================
+
+class _Config:
+    def __init__(self):
+        self.BOT_TOKEN = os.getenv("BOT_TOKEN")
+        self.BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+
+        admin_raw = os.getenv("ADMIN_ID", "")
+        self.ADMIN_IDS = [
+            int(x.strip()) for x in admin_raw.split(",")
+            if x.strip().isdigit()
+        ]
+        self.ADMIN_ID = self.ADMIN_IDS[0] if self.ADMIN_IDS else None
+
+        self.LOG_GROUP_ID = os.getenv("LOG_GROUP_ID", "")
+        self.FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")
+        self.SUPPORT_URL = os.getenv("SUPPORT_URL", "")
+
+        self.DUO_API_URL = os.getenv(
+            "DUO_API_URL",
+            "https://duoinfo.onrender.com/api/duo"
+        )
+
+        self.TIMEZONE_STR = os.getenv("TIMEZONE", "Asia/Dhaka")
+        try:
+            import pytz
+            self.TIMEZONE = pytz.timezone(self.TIMEZONE_STR)
+        except Exception:
+            self.TIMEZONE_STR = "Asia/Dhaka"
+            self.TIMEZONE = pytz.timezone("Asia/Dhaka")
+
+        self.REQUEST_COST = self._int_env("REQUEST_COST", 1, minimum=0)
+        self.DAILY_FREE_REQUESTS = self._int_env("DAILY_FREE_REQUESTS", 1, minimum=0)
+        self.REFERRAL_REWARD = self._int_env("REFERRAL_REWARD", 5, minimum=0)
+        self.PORT = self._int_env("PORT", 8080, minimum=1)
+
+        self.PEM = {
+            "target": "🎯", "money": "💰", "gift": "🎁",
+            "user": "👤", "view": "📊", "msg": "💬",
+            "crown": "👑", "no": "❌", "join": "📢",
+            "check": "✅", "warn": "⚠️", "group": "🤝",
+            "rocket": "🚀", "hi": "👋", "wait": "⏳",
+            "ok": "✅", "add": "➕", "rem": "➖",
+            "bell": "📢", "key": "🔐"
+        }
+
+    @staticmethod
+    def _int_env(name, default, minimum=None):
+        raw = os.getenv(name, str(default))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = default
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
+
+    def emoji(self, name: str, fallback: str = "") -> str:
+        return self.PEM.get(name, fallback)
+
+    def validate_config(self):
+        if not self.BOT_TOKEN:
+            raise ValueError(
+                "CRITICAL ERROR: BOT_TOKEN is missing in Environment Variables!"
+            )
+        if not self.ADMIN_IDS:
+            raise ValueError(
+                "CRITICAL ERROR: ADMIN_ID must be valid numeric Telegram user ID(s)."
+            )
+        if not self.LOG_GROUP_ID:
+            print(
+                "WARNING: LOG_GROUP_ID is not set! "
+                "Telegram DB backup will not persist across reboots."
+            )
+        print("Configuration loaded & validated successfully!")
+
+config = _Config()
 
 # --- Logging Setup ---
 logging.basicConfig(
